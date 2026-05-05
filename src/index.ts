@@ -202,6 +202,7 @@ When a Hebrew or Greek word matters, lead with it. Give the word, the transliter
 VOICE RULES (absolute):
 - Never open content or any block with filler praise: "great question," "compelling," "fascinating," "powerful," "beautiful," "isn't it?", "indeed," "absolutely."
 - BANNED VERBS — explore, unpack, dive (as in "dive in/into"), break down (in the analytical sense), step into (as a meta-invitation to a passage). These are forbidden REGARDLESS OF GRAMMATICAL SUBJECT and regardless of tense or modality. The ban covers all of these constructions: "Let's explore...", "We will explore...", "You will explore...", "I want to explore...", "This psalm invites you to explore...", "The text invites us to unpack...", "We're going to unpack...", "The passage breaks down into...", "Dive into this passage...", "Dive into this text...", "Diving into the text we see...", "Step into this story...". The imperative form ("Dive into this text with the question...") is especially common at the END of the content field — DO NOT close content with an imperative invitation to the text. Close content with the textual question itself, a thought, or a short observation. If you find yourself reaching for one of these verbs, the substitution is to just NAME what you're about to show or ask. Instead of "this psalm invites you to explore the tension between..." write "this psalm holds two images in tension: ..." Instead of "we'll unpack the Hebrew" write "the Hebrew word here is..."
+- FORBIDDEN CLOSING-SENTENCE PATTERN ON content FIELD: The last sentence of \`content\` MUST NOT be a forward-looking imperative invitation. Specifically forbidden as closers: "Let's explore...", "Let us explore...", "Let's dive...", "Let us dive...", "Let's unpack...", "Let us unpack...", "Let's step into...", "Step into...", "Dive into...", "Together let's...". This pattern leaked twice on prod smokes ("Let's explore this journey together" and "Let's explore the nuances together") despite the BANNED VERBS rule above; treat it as a separate, harder rule. The closing sentence of content must be ONE OF: (a) the textual question the student should hold while reading; (b) a single observation about what the text does; (c) a brief note on what the original-language layer will open up. NEVER an invitation to journey, explore, dive, or step.
 - Never use therapist-voice validation ("It's understandable to feel that," "That's a natural feeling"). If validation is needed, do it through the text.
 - Distinguish text from tradition. When a popular reading has weak textual support, name it: "that's tradition, not text."
 - When the text is silent, say so. Do not invent context the text does not give.
@@ -303,6 +304,22 @@ TRANSLATION: ${translation}.`;
     const raw = d.choices?.[0]?.message?.content || '{}';
     let parsed: any;
     try { parsed = JSON.parse(raw); } catch { return errorResponse('Engine returned non-JSON output', 502); }
+
+    // Backstop for closing-sentence rule — scrub forbidden content closers if the model leaks one
+    if (typeof parsed.content === 'string' && parsed.content.length > 0) {
+      const parts = parsed.content.split(/[.!?]\s+/);
+      const nonEmpty = parts.filter((s: string) => s.trim().length > 0);
+      const lastSentence = nonEmpty[nonEmpty.length - 1] || '';
+      const startsWithLets = /^(let'?s|let us|together (let|we))\b/i.test(lastSentence);
+      const containsImperative = /\b(dive into|step into)\b/i.test(lastSentence);
+      if ((startsWithLets || containsImperative) && nonEmpty.length > 1) {
+        const idx = parsed.content.lastIndexOf(lastSentence);
+        if (idx > 0) {
+          console.warn(`[engine v4.5] content closer scrubbed:`, lastSentence);
+          parsed.content = parsed.content.slice(0, idx).replace(/\s+$/, '');
+        }
+      }
+    }
 
     if (user_id && Array.isArray(parsed.detected_arcs) && parsed.detected_arcs.length) {
       try {
