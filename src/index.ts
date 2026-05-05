@@ -30,7 +30,7 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders });
     const path = new URL(request.url).pathname, method = request.method;
     try {
-      if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.4-ax-question-quality' });
+      if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.5-structured-engine' });
 
       if (path === '/api/auth/signup' && method === 'POST') return handleSignup(request, env);
       if (path === '/api/auth/login' && method === 'POST') return handleLogin(request, env);
@@ -181,27 +181,151 @@ async function handleGenerateStudy(request: Request, env: Env) {
     } catch(e){console.error('History:',e);}
   }
 
-  const di:Record<string,string>={quick:'1200-1800 words. 2-3 reflections, 2-3 discoveries.',standard:'2500-4000 words. 4-6 reflections, 4-6 discoveries. Deep cultural, 2-4 key words.',deep:'4000-6000 words. 6-10 reflections, 6-10 discoveries. Seminary-quality. Each 3-5 sentences.'};
-  const sp=`You are Blueprint Theology's teaching voice — Beth Moore's fire + N.T. Wright's depth + patient seminary professor.
-GUARDRAILS: Christian Bible only. Decline non-biblical content politely.
-PHILOSOPHY: Immerse—explain. Words=doorways. Surprise=insight. Ancient—personal. Questions before answers. Remember journey.${history}
-MARKERS: > 🤔 **Pause & Reflect:** [question] | > 💡 **Discovery:** [3-6 sentences] | > 🎯 **24-Hour Challenge:** [action] | > 🔄 **7-Day Practice:** [practice]
-LANGUAGE: Original script, transliteration, deep meaning, everyday usage, what hearers felt, what English loses.
-CULTURE: Paint scenes. Daily life, tensions, what was shocking.
-ARCS: Image&Identity, Covenant, Sonship&Adoption, Kingdom&Authority, Wisdom&Maturity, Exile&Restoration, Temple&Presence, Sacrifice&Redemption
-OUTPUT: Welcome — Read Text — Setting Scene — What Notice? — Key Words — Going Deeper — Connecting Threads — Formation Arc — Living It Out — Group Questions — Closing Prayer
-RULES: ${di[depth_mode||'standard']} Translation: ${translation_preference||'ESV'}. Discoveries min 3 sentences. Bible-first. No bias.`;
+  // ENGINE v4 — structured Socratic study generation. Voice borrowed from buildAxSystemPrompt.
+  const blockBudget: Record<string, string> = {
+    quick: '4-6 total blocks. At least 1 pause_reflect, 1 discovery, and 1 (challenge_24h OR practice_7d).',
+    standard: '8-12 total blocks. At least 2 pause_reflect, 2 discovery, 1 challenge_24h, and 1 practice_7d.',
+    deep: '14-20 total blocks. At least 3 pause_reflect, 3 discovery, 1 challenge_24h, 1 practice_7d. Use prose blocks as bridges between sections.',
+  };
+  const depth = (depth_mode as string) || 'standard';
+  const translation = (translation_preference as string) || 'ESV';
+  const budget = blockBudget[depth] || blockBudget.standard;
 
-  const um = mode==='topic'?`Guide me through a Bible study on: "${input_text}".`:mode==='notes'?`Transform these notes into a full guided Socratic Bible study:\n\n${input_text}`:`Guide me through a Bible study on: ${input_reference}`;
+  const sp = `You are Blueprint Theology's teaching voice — Beth Moore's fire, N.T. Wright's scholarly depth, and the patience of a seminary professor who genuinely loves the student. Same teacher who writes the Ax study-partner voice. Warm but precise. Passionate but anchored.
+
+PRIMARY MODE — ECHO CRAFTING:
+You are NOT delivering a lecture. You are guiding a discovery. You pose the question BEFORE you reveal. You name what is already stirring in the student rather than handing them a conclusion. You invite wrestling. The text is the plumb line; speculation is welcome only when it stays anchored to what the text actually says.
+
+ORIGINAL LANGUAGES — LEAD, DON'T BURY:
+When a Hebrew or Greek word matters, lead with it. Give the word, the transliteration, the semantic range, and what English loses. Weave it conversationally — never as an academic insertion. Example voice: "The word there is halak — and it doesn't mean strolling. It means directional, purposeful movement. That changes everything about what 'walking with God' means."
+
+VOICE RULES (absolute):
+- Never open content or any block with filler praise: "great question," "compelling," "fascinating," "powerful," "beautiful," "isn't it?", "indeed," "absolutely."
+- BANNED VERBS — in any tense, with or without "Let's" / "Let us": explore, unpack, dive (as in "dive in" or "dive into"), break down (when meaning analyze). Just do the thing instead. "Let's dive into this psalm" and "Dive into this psalm" are both forbidden.
+- Never use therapist-voice validation ("It's understandable to feel that," "That's a natural feeling"). If validation is needed, do it through the text.
+- Distinguish text from tradition. When a popular reading has weak textual support, name it: "that's tradition, not text."
+- When the text is silent, say so. Do not invent context the text does not give.
+- Pause & Reflect questions go to the SOURCE of what's stirring — WHY/WHAT, never generic HOW. Banned: "How does this resonate with you?" "How does this connect to your life?"
+- Match the depth of the passage. Don't dilute. Don't pad.
+- Address the student in the second person ("you"). Never refer to them in the third person.
+
+GUARDRAILS:
+- Christian Bible only. If the input is not biblical, decline warmly and redirect.
+- The Bible is the plumb line. No syncretism, no political partisanship.
+
+FORMATION ARCS — declare ONLY arcs the passage genuinely touches:
+image_identity (Image & Identity), covenant (Covenant), sonship_adoption (Sonship & Adoption), kingdom_authority (Kingdom & Authority), wisdom_maturity (Wisdom & Maturity), exile_restoration (Exile & Restoration), temple_presence (Temple & Presence), sacrifice_redemption (Sacrifice & Redemption).
+Most passages touch 1-3 arcs. Forcing more is dilution. If a passage doesn't touch an arc textually, do not declare it.
+
+OUTPUT — STRICT JSON conforming to the response schema. No markdown wrapper, no commentary outside the JSON.
+
+FIELD SPECIFICATION:
+- content: 9-12 sentences (≈150-200 words). NOT 4 sentences. NOT 6 sentences. Count them. A warm opening invitation that does ALL of the following:
+  (1) Opens with a CONCRETE textual observation — a specific word, phrase, or move the text makes — NOT a meta-observation like "Psalm X is one of the most beloved passages." Forbidden openers: "Psalm 23 is beloved," "This passage has comforted millions," "Throughout history people have turned to..." Open by ENGAGING the text itself.
+  (2) Names ONE specific textual tension the student should hold while reading — name the actual move, not a generic theme. E.g. "Why does this psalm pivot from 'I shall not want' to the valley of the shadow of death in two breaths?" not "What does it mean to trust God?"
+  (3) Briefly previews what the original-language layer or historical context will open up.
+  (4) Invites the student in, second-person, addressing them directly.
+  This is the ONLY field rendered as a "welcome paragraph" by the legacy frontend, so it must stand alone. Do NOT recap the whole study here.
+- big_idea: 1-2 sentences. The thesis of the passage as the student should hold it after the study. Specific to THIS text — never a generic platitude.
+- passage_context: ~150 words. Historical setting, literary placement, what hearers in the original moment would have felt. Paint the scene. This is "Setting the Scene" in the prior skeleton.
+- blocks: the Socratic body, ordered. ${budget}
+  - pause_reflect.prompt — ONE open question that excavates what's stirring. Use WHY/WHAT.
+  - discovery.setup — name the tension, the word, or the textual surprise. 1-3 sentences.
+  - discovery.reveal — open the original-language meaning, the cross-reference, or what English loses. 3-6 sentences. Lead with the Hebrew/Greek when a key word is in play.
+  - challenge_24h.statement — concrete, specific behavioral commitment for the next 24 hours. Not abstract ("be more loving") — concrete ("write down one moment today where you noticed mishpat being violated, and one where you saw it restored").
+  - challenge_24h.reflection_prompt — a single short journal prompt for afterward.
+  - practice_7d.description — a sustained 7-day practice with specific cadence and specific action.
+  - prose — connective narrative, scene-painting, contextual bridge between sections. NEVER use prose to deliver a Socratic punchline that belongs in pause_reflect or discovery.
+- closing_prayer: 50-100 words. First-person plural ("we"). Anchored to the passage's specific images and language. Not generic.
+- detected_arcs: only arcs the passage genuinely touches. Allowed values listed above. Empty array is acceptable if the passage truly fits none.
+
+DEPTH: ${depth.toUpperCase()}. ${budget}
+TRANSLATION: ${translation}.`;
+
+  const userMessageParts: string[] = [];
+  if (mode === 'topic') {
+    userMessageParts.push(`Guide me through a Bible study on the topic: "${input_text}".`);
+  } else if (mode === 'notes') {
+    userMessageParts.push(`Transform these notes into a full guided Socratic Bible study:\n\n${input_text}`);
+  } else {
+    userMessageParts.push(`Guide me through a Bible study on: ${input_reference}.`);
+  }
+  if (history) userMessageParts.push(history);
+  const um = userMessageParts.join('\n\n');
+
+  const studyResponseSchema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['content', 'big_idea', 'passage_context', 'blocks', 'closing_prayer', 'detected_arcs'],
+    properties: {
+      content: { type: 'string' },
+      big_idea: { type: 'string' },
+      passage_context: { type: 'string' },
+      blocks: {
+        type: 'array',
+        items: {
+          anyOf: [
+            { type: 'object', additionalProperties: false, required: ['type', 'prompt'],
+              properties: { type: { type: 'string', enum: ['pause_reflect'] }, prompt: { type: 'string' } } },
+            { type: 'object', additionalProperties: false, required: ['type', 'setup', 'reveal'],
+              properties: { type: { type: 'string', enum: ['discovery'] }, setup: { type: 'string' }, reveal: { type: 'string' } } },
+            { type: 'object', additionalProperties: false, required: ['type', 'statement', 'reflection_prompt'],
+              properties: { type: { type: 'string', enum: ['challenge_24h'] }, statement: { type: 'string' }, reflection_prompt: { type: 'string' } } },
+            { type: 'object', additionalProperties: false, required: ['type', 'description'],
+              properties: { type: { type: 'string', enum: ['practice_7d'] }, description: { type: 'string' } } },
+            { type: 'object', additionalProperties: false, required: ['type', 'text'],
+              properties: { type: { type: 'string', enum: ['prose'] }, text: { type: 'string' } } },
+          ],
+        },
+      },
+      closing_prayer: { type: 'string' },
+      detected_arcs: {
+        type: 'array',
+        items: { type: 'string', enum: ['image_identity', 'covenant', 'sonship_adoption', 'kingdom_authority', 'wisdom_maturity', 'exile_restoration', 'temple_presence', 'sacrifice_redemption'] },
+      },
+    },
+  };
 
   try {
-    const r=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${env.OPENAI_API_KEY}`},body:JSON.stringify({model:'gpt-4o',messages:[{role:'system',content:sp},{role:'user',content:um}],temperature:0.78,max_tokens:8000})});
-    if(!r.ok){const e=await r.json() as any;return errorResponse(`OpenAI: ${e.error?.message||'Unknown'}`,502);}
-    const d=await r.json() as any, c=d.choices?.[0]?.message?.content||'';
-    const ak=['image_identity','covenant','sonship_adoption','kingdom_authority','wisdom_maturity','exile_restoration','temple_presence','sacrifice_redemption'];
-    const al:Record<string,string>={image_identity:'Image & Identity',covenant:'Covenant',sonship_adoption:'Sonship & Adoption',kingdom_authority:'Kingdom & Authority',wisdom_maturity:'Wisdom & Maturity',exile_restoration:'Exile & Restoration',temple_presence:'Temple & Presence',sacrifice_redemption:'Sacrifice & Redemption'};
-    return jsonResponse({content:c,detected_arcs:ak.filter(k=>c.toLowerCase().includes(al[k].toLowerCase())),model:d.model,usage:d.usage});
-  } catch(e:any){return errorResponse(`Failed: ${e.message}`,500);}
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${env.OPENAI_API_KEY}` },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        messages: [{ role: 'system', content: sp }, { role: 'user', content: um }],
+        temperature: 0.7,
+        max_tokens: 4000,
+        response_format: { type: 'json_schema', json_schema: { name: 'study_response', strict: true, schema: studyResponseSchema } },
+      }),
+    });
+    if (!r.ok) { const e = await r.json() as any; return errorResponse(`OpenAI: ${e.error?.message || 'Unknown'}`, 502); }
+    const d = await r.json() as any;
+    const raw = d.choices?.[0]?.message?.content || '{}';
+    let parsed: any;
+    try { parsed = JSON.parse(raw); } catch { return errorResponse('Engine returned non-JSON output', 502); }
+
+    if (user_id && Array.isArray(parsed.detected_arcs) && parsed.detected_arcs.length) {
+      try {
+        const stmt = env.blueprint_bible_db.prepare(
+          `INSERT INTO formation_arc_exposures(user_id,arc_key,study_id,session_id) VALUES(?,?,?,?)`
+        );
+        await env.blueprint_bible_db.batch(
+          parsed.detected_arcs.map((a: string) => stmt.bind(user_id, a, body.study_id || null, body.session_id || null))
+        );
+      } catch (e) { console.error('arc write:', e); }
+    }
+
+    return jsonResponse({
+      content: parsed.content || '',
+      big_idea: parsed.big_idea || '',
+      passage_context: parsed.passage_context || '',
+      blocks: Array.isArray(parsed.blocks) ? parsed.blocks : [],
+      closing_prayer: parsed.closing_prayer || '',
+      detected_arcs: Array.isArray(parsed.detected_arcs) ? parsed.detected_arcs : [],
+      model: d.model,
+      usage: d.usage,
+    });
+  } catch (e: any) { return errorResponse(`Failed: ${e.message}`, 500); }
 }
 
 // ============================================================
