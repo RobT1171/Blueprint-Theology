@@ -117,6 +117,16 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   const path = new URL(request.url).pathname, method = request.method;
   if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.6-magic-link' });
 
+  // TEMP: pre-smoke prod secret shape verification. Removed before final push.
+  if (path === '/api/_diag/secrets-shape' && method === 'GET') {
+    const k = env.RESEND_API_KEY || '';
+    const f = env.FRONTEND_URL || '';
+    return jsonResponse({
+      RESEND_API_KEY: { length: k.length, first4: k.slice(0, 4), starts_with_re_underscore: k.startsWith('re_'), has_whitespace: /\s/.test(k) },
+      FRONTEND_URL: { length: f.length, first6: f.slice(0, 6), has_whitespace: /\s/.test(f) },
+    });
+  }
+
   if (path === '/api/auth/request-magic-link' && method === 'POST') return handleRequestMagicLink(request, env);
   if (path === '/api/auth/verify-magic-link' && method === 'POST') return handleVerifyMagicLink(request, env);
   if (path === '/api/auth/signup' && method === 'POST') return handleRetiredAuth();
