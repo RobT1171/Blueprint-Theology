@@ -1,21 +1,92 @@
 /**
  * Blueprint Theology - Cloudflare Worker API
- * v3.1 — Fixed Groups auth (GET /api/groups + auto owner_id from token)
+ * v4.6 — Magic link authentication + cookie sessions (HttpOnly, Secure, SameSite=None)
  */
 
-export interface Env { blueprint_bible_db: D1Database; OPENAI_API_KEY: string; }
+export interface Env {
+  blueprint_bible_db: D1Database;
+  OPENAI_API_KEY: string;
+  RESEND_API_KEY: string;
+  FRONTEND_URL: string;
+}
 
-const corsHeaders = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' };
-function jsonResponse(data: any, status = 200) { return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...corsHeaders } }); }
-function errorResponse(message: string, status = 400) { return jsonResponse({ error: message }, status); }
+const ALLOWED_ORIGINS = [
+  'https://aibibletool.com',
+  'https://www.aibibletool.com',
+];
+
+function buildCorsHeaders(origin: string | null): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Max-Age': '86400',
+    'Vary': 'Origin',
+  };
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    headers['Access-Control-Allow-Origin'] = origin;
+  }
+  return headers;
+}
+
+function withCors(response: Response, cors: Record<string, string>): Response {
+  const headers = new Headers(response.headers);
+  for (const [k, v] of Object.entries(cors)) headers.set(k, v);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function jsonResponse(data: any, status = 200, extraHeaders: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
+  });
+}
+function errorResponse(message: string, status = 400): Response {
+  return jsonResponse({ error: message }, status);
+}
+
 async function hashPassword(p: string): Promise<string> { const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(p + 'blueprint-theology-salt-2026')); return Array.from(new Uint8Array(h)).map(b => b.toString(16).padStart(2, '0')).join(''); }
 function generateToken(): string { const a = new Uint8Array(32); crypto.getRandomValues(a); return Array.from(a).map(b => b.toString(16).padStart(2, '0')).join(''); }
 function generateInviteCode(): string { const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'; let code = ''; for (let i = 0; i < 8; i++) code += chars.charAt(Math.floor(Math.random() * chars.length)); return code; }
 
-async function getUserFromToken(request: Request, env: Env): Promise<any | null> {
+const SESSION_COOKIE_MAX_AGE = 30 * 24 * 60 * 60;
+const MAGIC_LINK_TTL_MINUTES = 15;
+const MAGIC_LINK_RATE_WINDOW_MINUTES = 10;
+const MAGIC_LINK_RATE_LIMIT = 3;
+const RETIRED_AUTH_MESSAGE = 'Password authentication has been replaced. Sign in via magic link at https://aibibletool.com/auth/sign-in';
+
+function parseCookies(header: string | null): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const piece of header.split(';')) {
+    const idx = piece.indexOf('=');
+    if (idx < 0) continue;
+    const k = piece.slice(0, idx).trim();
+    const v = piece.slice(idx + 1).trim();
+    if (k) out[k] = decodeURIComponent(v);
+  }
+  return out;
+}
+
+function sessionTokenFromRequest(request: Request): string | null {
+  const cookies = parseCookies(request.headers.get('Cookie'));
+  if (cookies.bt_session) return cookies.bt_session;
   const ah = request.headers.get('Authorization');
-  if (!ah?.startsWith('Bearer ')) return null;
-  const s = await env.blueprint_bible_db.prepare(`SELECT user_id FROM auth_sessions WHERE token=? AND (expires_at IS NULL OR expires_at > datetime('now'))`).bind(ah.slice(7)).first() as any;
+  if (ah?.startsWith('Bearer ')) return ah.slice(7);
+  return null;
+}
+
+function buildSessionCookie(token: string): string {
+  return `bt_session=${token}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=${SESSION_COOKIE_MAX_AGE}`;
+}
+function clearSessionCookie(): string {
+  return `bt_session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0`;
+}
+
+async function getUserFromToken(request: Request, env: Env): Promise<any | null> {
+  const token = sessionTokenFromRequest(request);
+  if (!token) return null;
+  const s = await env.blueprint_bible_db.prepare(`SELECT user_id FROM auth_sessions WHERE token=? AND (expires_at IS NULL OR expires_at > datetime('now'))`).bind(token).first() as any;
   if (!s) return null;
   return await env.blueprint_bible_db.prepare(`SELECT id,name,email,subscription_plan,total_xp,level,streak_count,longest_streak,studies_completed,tasks_completed,engagement_score,created_at FROM user_profiles WHERE id=?`).bind(s.user_id).first();
 }
@@ -27,17 +98,33 @@ async function moderateContent(text: string, apiKey: string): Promise<{ flagged:
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders });
-    const path = new URL(request.url).pathname, method = request.method;
+    const origin = request.headers.get('Origin');
+    const cors = buildCorsHeaders(origin);
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: cors });
+    }
+    let response: Response;
     try {
-      if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.5-structured-engine' });
+      response = await handleRequest(request, env);
+    } catch (err: any) {
+      response = errorResponse(err.message || 'Internal server error', 500);
+    }
+    return withCors(response, cors);
+  },
+};
 
-      if (path === '/api/auth/signup' && method === 'POST') return handleSignup(request, env);
-      if (path === '/api/auth/login' && method === 'POST') return handleLogin(request, env);
-      if (path === '/api/auth/logout' && method === 'POST') return handleLogout(request, env);
-      if (path === '/api/auth/me' && method === 'GET') return handleGetMe(request, env);
+async function handleRequest(request: Request, env: Env): Promise<Response> {
+  const path = new URL(request.url).pathname, method = request.method;
+  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.6-magic-link' });
 
-      if (path === '/api/users' && method === 'POST') return handleCreateUser(request, env);
+  if (path === '/api/auth/request-magic-link' && method === 'POST') return handleRequestMagicLink(request, env);
+  if (path === '/api/auth/verify-magic-link' && method === 'POST') return handleVerifyMagicLink(request, env);
+  if (path === '/api/auth/signup' && method === 'POST') return handleRetiredAuth();
+  if (path === '/api/auth/login' && method === 'POST') return handleRetiredAuth();
+  if (path === '/api/auth/logout' && method === 'POST') return handleLogout(request, env);
+  if (path === '/api/auth/me' && method === 'GET') return handleGetMe(request, env);
+
+  if (path === '/api/users' && method === 'POST') return handleCreateUser(request, env);
       if (path.match(/^\/api\/users\/[\w-]+$/) && method === 'GET') return handleGetUser(path.split('/')[3], env);
       if (path.match(/^\/api\/users\/[\w-]+$/) && method === 'PUT') return handleUpdateUser(path.split('/')[3], request, env);
 
@@ -87,38 +174,182 @@ export default {
       if (path.match(/^\/api\/groups\/[\w-]+\/leave$/) && method === 'POST') return handleLeaveGroup(path.split('/')[3], request, env);
       if (path.match(/^\/api\/groups\/[\w-]+$/) && method === 'GET') return handleGetGroupDetail(path.split('/')[3], env);
 
-      if (path.match(/^\/api\/dashboard\/[\w-]+$/) && method === 'GET') return handleGetDashboard(path.split('/')[3], env);
+  if (path.match(/^\/api\/dashboard\/[\w-]+$/) && method === 'GET') return handleGetDashboard(path.split('/')[3], env);
 
-      return errorResponse('Not found', 404);
-    } catch (err: any) { return errorResponse(err.message || 'Internal server error', 500); }
-  },
-};
+  return errorResponse('Not found', 404);
+}
 
 // ============================================================
 // AUTH
 // ============================================================
-async function handleSignup(request: Request, env: Env) {
-  const b = await request.json() as any;
-  if (!b.email || !b.password) return errorResponse('Email and password required');
-  if (b.password.length < 6) return errorResponse('Password must be at least 6 characters');
-  const em = b.email.toLowerCase().trim();
-  if (await env.blueprint_bible_db.prepare(`SELECT id FROM user_profiles WHERE email=?`).bind(em).first()) return errorResponse('An account with this email already exists');
-  const uid = crypto.randomUUID(), tk = generateToken();
-  await env.blueprint_bible_db.prepare(`INSERT INTO user_profiles (id,name,email,password_hash) VALUES(?,?,?,?)`).bind(uid, b.name||'', em, await hashPassword(b.password)).run();
-  await env.blueprint_bible_db.prepare(`INSERT INTO auth_sessions (id,user_id,token,expires_at) VALUES(?,?,?,?)`).bind(crypto.randomUUID(), uid, tk, new Date(Date.now()+30*24*60*60*1000).toISOString()).run();
-  return jsonResponse({ user: { id:uid, name:b.name||'', email:em, subscription_plan:'free', total_xp:0, level:1, streak_count:0 }, token:tk });
+// Password auth retired — both endpoints redirect to magic link flow.
+function handleRetiredAuth(): Response {
+  return jsonResponse({ error: RETIRED_AUTH_MESSAGE }, 410);
 }
-async function handleLogin(request: Request, env: Env) {
-  const b = await request.json() as any;
-  if (!b.email || !b.password) return errorResponse('Email and password required');
-  const u = await env.blueprint_bible_db.prepare(`SELECT id,name,email,subscription_plan,total_xp,level,streak_count,longest_streak,studies_completed,tasks_completed,engagement_score FROM user_profiles WHERE email=? AND password_hash=?`).bind(b.email.toLowerCase().trim(), await hashPassword(b.password)).first() as any;
-  if (!u) return errorResponse('Invalid email or password', 401);
-  const tk = generateToken();
-  await env.blueprint_bible_db.prepare(`INSERT INTO auth_sessions (id,user_id,token,expires_at) VALUES(?,?,?,?)`).bind(crypto.randomUUID(), u.id, tk, new Date(Date.now()+30*24*60*60*1000).toISOString()).run();
-  return jsonResponse({ user:u, token:tk });
+
+async function handleRequestMagicLink(request: Request, env: Env): Promise<Response> {
+  const body = await request.json().catch(() => ({})) as any;
+  const rawEmail = (body?.email ?? '').toString().trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawEmail)) {
+    return errorResponse('Invalid email address', 400);
+  }
+  const email = rawEmail.toLowerCase();
+
+  const recent = await env.blueprint_bible_db.prepare(
+    `SELECT COUNT(*) AS cnt FROM magic_link_tokens WHERE email = ? AND created_at > datetime('now', '-${MAGIC_LINK_RATE_WINDOW_MINUTES} minutes')`
+  ).bind(email).first() as any;
+  if (recent && (recent.cnt ?? 0) >= MAGIC_LINK_RATE_LIMIT) {
+    return errorResponse('Too many requests. Please wait 10 minutes.', 429);
+  }
+
+  const token = generateToken();
+  await env.blueprint_bible_db.prepare(
+    `INSERT INTO magic_link_tokens (token, email, expires_at) VALUES (?, ?, datetime('now', '+${MAGIC_LINK_TTL_MINUTES} minutes'))`
+  ).bind(token, email).run();
+
+  const baseUrl = (env.FRONTEND_URL || 'https://aibibletool.com').replace(/\/$/, '');
+  const magicUrl = `${baseUrl}/auth/verify?token=${token}`;
+
+  try {
+    await sendMagicLinkEmail(email, magicUrl, env);
+  } catch (e) {
+    console.error('Magic link email send failed:', e);
+    return errorResponse('Email send failed. Please try again.', 500);
+  }
+
+  return jsonResponse({ sent: true });
 }
-async function handleLogout(r: Request, env: Env) { const a=r.headers.get('Authorization'); if(a?.startsWith('Bearer ')) await env.blueprint_bible_db.prepare(`DELETE FROM auth_sessions WHERE token=?`).bind(a.slice(7)).run(); return jsonResponse({success:true}); }
-async function handleGetMe(r: Request, env: Env) { const u=await getUserFromToken(r,env); if(!u) return errorResponse('Not authenticated',401); return jsonResponse(u); }
+
+async function handleVerifyMagicLink(request: Request, env: Env): Promise<Response> {
+  const body = await request.json().catch(() => ({})) as any;
+  const token = (body?.token ?? '').toString().trim();
+  if (!token) return errorResponse('Token required', 400);
+
+  const row = await env.blueprint_bible_db.prepare(
+    `SELECT email, used_at, CASE WHEN expires_at > datetime('now') THEN 1 ELSE 0 END AS valid FROM magic_link_tokens WHERE token = ?`
+  ).bind(token).first() as any;
+
+  if (!row) return errorResponse('invalid', 401);
+  if (row.used_at) return errorResponse('used', 401);
+  if (!row.valid) return errorResponse('expired', 401);
+
+  // Atomic mark-used: only succeeds if used_at IS NULL (race-condition safe)
+  const update = await env.blueprint_bible_db.prepare(
+    `UPDATE magic_link_tokens SET used_at = datetime('now') WHERE token = ? AND used_at IS NULL`
+  ).bind(token).run();
+  if (!update.success || !((update.meta && (update.meta as any).changes) || 0)) {
+    return errorResponse('used', 401);
+  }
+
+  const email = (row.email || '').toString().toLowerCase();
+  let user = await env.blueprint_bible_db.prepare(
+    `SELECT id, email FROM user_profiles WHERE email = ?`
+  ).bind(email).first() as any;
+
+  if (!user) {
+    const newId = crypto.randomUUID();
+    await env.blueprint_bible_db.prepare(
+      `INSERT INTO user_profiles (id, name, email) VALUES (?, ?, ?)`
+    ).bind(newId, '', email).run();
+    user = { id: newId, email };
+  }
+
+  const sessionToken = generateToken();
+  const expiresAt = new Date(Date.now() + SESSION_COOKIE_MAX_AGE * 1000).toISOString();
+  await env.blueprint_bible_db.prepare(
+    `INSERT INTO auth_sessions (id, user_id, token, expires_at) VALUES (?, ?, ?, ?)`
+  ).bind(crypto.randomUUID(), user.id, sessionToken, expiresAt).run();
+
+  return jsonResponse(
+    { user: { id: user.id, email: user.email } },
+    200,
+    { 'Set-Cookie': buildSessionCookie(sessionToken) }
+  );
+}
+
+async function handleLogout(request: Request, env: Env): Promise<Response> {
+  const token = sessionTokenFromRequest(request);
+  if (token) {
+    await env.blueprint_bible_db.prepare(`DELETE FROM auth_sessions WHERE token=?`).bind(token).run();
+  }
+  return jsonResponse({ ok: true }, 200, { 'Set-Cookie': clearSessionCookie() });
+}
+
+async function handleGetMe(request: Request, env: Env): Promise<Response> {
+  const u = await getUserFromToken(request, env);
+  if (!u) return errorResponse('Not authenticated', 401);
+  return jsonResponse(u);
+}
+
+async function sendMagicLinkEmail(email: string, magicUrl: string, env: Env): Promise<void> {
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: 'Blueprint Theology <support@blueprinttheology.com>',
+      to: email,
+      subject: 'Your sign-in link for Blueprint Theology',
+      html: buildMagicLinkEmailHtml(magicUrl),
+      text: buildMagicLinkEmailText(magicUrl),
+    }),
+  });
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => '');
+    console.error('Resend send failed:', response.status, errorBody);
+    throw new Error('Email send failed');
+  }
+}
+
+function buildMagicLinkEmailHtml(magicUrl: string): string {
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>Sign in to Blueprint Theology</title></head>
+<body style="margin:0;padding:0;background:#FBFAF7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#1A1816;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#FBFAF7;padding:40px 16px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:520px;background:#FFFFFF;border:1px solid rgba(0,0,0,0.08);border-radius:12px;padding:40px 32px;">
+        <tr><td style="padding-bottom:24px;">
+          <div style="font-size:18px;font-weight:600;color:#1E3A5F;letter-spacing:-0.01em;">Blueprint Theology</div>
+        </td></tr>
+        <tr><td style="font-size:15px;line-height:1.65;color:#1A1816;padding-bottom:20px;">Hi there,</td></tr>
+        <tr><td style="font-size:15px;line-height:1.65;color:#1A1816;padding-bottom:24px;">Click the button below to sign in to your Blueprint Theology account.</td></tr>
+        <tr><td style="padding-bottom:24px;">
+          <a href="${magicUrl}" style="display:inline-block;background:#1E3A5F;color:#F5F2EC;text-decoration:none;padding:12px 28px;border-radius:8px;font-size:14px;font-weight:500;">Sign in</a>
+        </td></tr>
+        <tr><td style="font-size:13px;line-height:1.55;color:#5C564E;padding-bottom:16px;">Or copy and paste this URL into your browser:</td></tr>
+        <tr><td style="font-size:13px;line-height:1.55;color:#1E3A5F;word-break:break-all;padding-bottom:24px;">
+          <a href="${magicUrl}" style="color:#1E3A5F;text-decoration:underline;">${magicUrl}</a>
+        </td></tr>
+        <tr><td style="font-size:13px;line-height:1.55;color:#5C564E;padding-bottom:16px;">This link expires in 15 minutes for security.</td></tr>
+        <tr><td style="font-size:13px;line-height:1.55;color:#9C9486;padding-bottom:24px;">If you didn't request this, you can safely ignore this email — no account changes will occur.</td></tr>
+        <tr><td style="font-size:12px;line-height:1.5;color:#9C9486;border-top:1px solid rgba(0,0,0,0.08);padding-top:20px;">
+          support@blueprinttheology.com&nbsp;&nbsp;•&nbsp;&nbsp;aibibletool.com
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+}
+
+function buildMagicLinkEmailText(magicUrl: string): string {
+  return `Hi there,
+
+Click this link to sign in to your Blueprint Theology account:
+
+${magicUrl}
+
+This link expires in 15 minutes for security.
+
+If you didn't request this, you can safely ignore this email — no account changes will occur.
+
+—
+Blueprint Theology
+support@blueprinttheology.com
+aibibletool.com
+`;
+}
 
 // ============================================================
 // DASHBOARD
