@@ -13,6 +13,7 @@ export interface Env {
 const ALLOWED_ORIGINS = [
   'https://aibibletool.com',
   'https://www.aibibletool.com',
+  'https://api.aibibletool.com',
 ];
 
 function buildCorsHeaders(origin: string | null): Record<string, string> {
@@ -115,7 +116,7 @@ export default {
 
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const path = new URL(request.url).pathname, method = request.method;
-  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.6-magic-link' });
+  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.7-same-site-cookie' });
 
   if (path === '/api/auth/request-magic-link' && method === 'POST') return handleRequestMagicLink(request, env);
   if (path === '/api/auth/verify-magic-link' && method === 'POST') return handleVerifyMagicLink(request, env);
