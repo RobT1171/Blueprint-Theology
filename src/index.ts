@@ -117,7 +117,7 @@ export default {
 
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const path = new URL(request.url).pathname, method = request.method;
-  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.10-user-profile-patch' });
+  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.11-group-delete' });
 
   if (path === '/api/auth/request-magic-link' && method === 'POST') return handleRequestMagicLink(request, env);
   if (path === '/api/auth/verify-magic-link' && method === 'POST') return handleVerifyMagicLink(request, env);
@@ -172,6 +172,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       if (path === '/api/groups/join' && method === 'POST') return handleJoinGroup(request, env);
       if (path.match(/^\/api\/groups\/user\/[\w-]+$/) && method === 'GET') return handleGetUserGroups(path.split('/')[4], env);
       if (path.match(/^\/api\/groups\/invite\/[\w]+$/) && method === 'GET') return handleGetGroupByInvite(path.split('/')[4], env);
+      if (path.match(/^\/api\/groups\/[\w-]+$/) && method === 'DELETE') return handleDeleteGroup(path.split('/')[3], request, env);
       if (path.match(/^\/api\/groups\/[\w-]+\/share$/) && method === 'POST') return handleShareStudy(path.split('/')[3], request, env);
       if (path.match(/^\/api\/groups\/[\w-]+\/studies$/) && method === 'GET') return handleGetGroupStudies(path.split('/')[3], env);
       if (path.match(/^\/api\/groups\/[\w-]+\/discuss$/) && method === 'POST') return handlePostDiscussion(path.split('/')[3], request, env);
@@ -1149,6 +1150,24 @@ async function handleGetGroupDetail(groupId: string, env: Env) {
   `).bind(groupId).all();
 
   return jsonResponse({ ...group, members: members.results || [] });
+}
+
+async function handleDeleteGroup(groupId: string, request: Request, env: Env) {
+  const user = await getUserFromToken(request, env);
+  if (!user) return errorResponse('Not authenticated', 401);
+
+  const group = await env.blueprint_bible_db.prepare(`SELECT id, owner_id FROM groups WHERE id = ?`).bind(groupId).first() as any;
+  if (!group) return errorResponse('Group not found', 404);
+  if (group.owner_id !== user.id) return errorResponse('Forbidden', 403);
+
+  await env.blueprint_bible_db.batch([
+    env.blueprint_bible_db.prepare(`DELETE FROM group_discussions WHERE group_id = ?`).bind(groupId),
+    env.blueprint_bible_db.prepare(`DELETE FROM group_studies WHERE group_id = ?`).bind(groupId),
+    env.blueprint_bible_db.prepare(`DELETE FROM group_members WHERE group_id = ?`).bind(groupId),
+    env.blueprint_bible_db.prepare(`DELETE FROM groups WHERE id = ?`).bind(groupId),
+  ]);
+
+  return jsonResponse({ id: groupId, deleted: true });
 }
 
 async function handleGetGroupMembers(groupId: string, env: Env) {
