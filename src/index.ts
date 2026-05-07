@@ -7,6 +7,7 @@ export interface Env {
   blueprint_bible_db: D1Database;
   OPENAI_API_KEY: string;
   RESEND_API_KEY: string;
+  UNSUBSCRIBE_SECRET: string;
   FRONTEND_URL: string;
 }
 
@@ -56,6 +57,7 @@ const MAGIC_LINK_RATE_WINDOW_MINUTES = 10;
 const MAGIC_LINK_RATE_LIMIT = 3;
 const RETIRED_AUTH_MESSAGE = 'Password authentication has been replaced. Sign in via magic link at https://aibibletool.com/auth/sign-in';
 const USER_PROFILE_SELECT = `id,name,email,subscription_plan,total_xp,level,streak_count,longest_streak,studies_completed,tasks_completed,engagement_score,twitter_handle,instagram_handle,linkedin_handle,facebook_handle,theme_preference,default_translation,default_depth,created_at`;
+const SHARE_EMAIL_FROM = 'Blueprint Theology <support@blueprinttheology.com>';
 
 function parseCookies(header: string | null): Record<string, string> {
   const out: Record<string, string> = {};
@@ -117,7 +119,7 @@ export default {
 
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const path = new URL(request.url).pathname, method = request.method;
-  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.11-group-delete' });
+  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.12-list-unsubscribe' });
 
   if (path === '/api/auth/request-magic-link' && method === 'POST') return handleRequestMagicLink(request, env);
   if (path === '/api/auth/verify-magic-link' && method === 'POST') return handleVerifyMagicLink(request, env);
@@ -126,6 +128,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (path === '/api/auth/logout' && method === 'POST') return handleLogout(request, env);
   if (path === '/api/auth/me' && method === 'GET') return handleGetMe(request, env);
   if (path === '/api/share' && method === 'POST') return handleShare(request, env);
+  if (path === '/api/unsubscribe' && (method === 'POST' || method === 'GET')) return handleUnsubscribe(request, env);
 
   if (path === '/api/users' && method === 'POST') return handleCreateUser(request, env);
   if (path === '/api/users/me' && method === 'PATCH') return handlePatchUser(request, env);
@@ -227,6 +230,33 @@ async function handleRequestMagicLink(request: Request, env: Env): Promise<Respo
   return jsonResponse({ sent: true });
 }
 
+async function signUnsubToken(email: string, shareId: string, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${email}:${shareId}`));
+  return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function verifyUnsubToken(email: string, shareId: string, token: string, secret: string): Promise<boolean> {
+  const expected = await signUnsubToken(email, shareId, secret);
+  if (expected.length !== token.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < expected.length; i++) {
+    mismatch |= expected.charCodeAt(i) ^ token.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
+function buildUnsubscribeUrl(email: string, shareId: string, token: string): string {
+  const params = new URLSearchParams({ email, share: shareId, token });
+  return `https://api.aibibletool.com/api/unsubscribe?${params.toString()}`;
+}
+
 async function handleVerifyMagicLink(request: Request, env: Env): Promise<Response> {
   const body = await request.json().catch(() => ({})) as any;
   const token = (body?.token ?? '').toString().trim();
@@ -271,6 +301,38 @@ async function handleVerifyMagicLink(request: Request, env: Env): Promise<Respon
     { user: { id: user.id, email: user.email } },
     200,
     { 'Set-Cookie': buildSessionCookie(sessionToken) }
+  );
+}
+
+async function handleUnsubscribe(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const email = (url.searchParams.get('email') || '').toLowerCase().trim();
+  const shareId = url.searchParams.get('share') || '';
+  const token = url.searchParams.get('token') || '';
+
+  if (!email || !shareId || !token) {
+    return new Response('Invalid unsubscribe link', { status: 400, headers: { 'Content-Type': 'text/html' } });
+  }
+
+  const valid = await verifyUnsubToken(email, shareId, token, env.UNSUBSCRIBE_SECRET);
+  if (!valid) {
+    return new Response('Invalid or expired unsubscribe link', { status: 400, headers: { 'Content-Type': 'text/html' } });
+  }
+
+  const userAgent = request.headers.get('User-Agent') || '';
+  await env.blueprint_bible_db.prepare(
+    `INSERT OR IGNORE INTO unsubscribes (email, source, user_agent, share_id) VALUES (?, 'one_click', ?, ?)`
+  ).bind(email, userAgent, shareId).run();
+
+  return new Response(
+    `<!doctype html><html><head><meta charset="utf-8"><title>Unsubscribed</title>
+     <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#FBFAF7;color:#1A1816;margin:0;padding:80px 24px;text-align:center}
+     .card{max-width:440px;margin:0 auto;background:#fff;border:1px solid rgba(0,0,0,0.08);border-radius:12px;padding:48px 32px}
+     h1{font-size:22px;color:#1E3A5F;margin:0 0 16px}p{font-size:15px;line-height:1.6;color:#5C564E;margin:0 0 12px}</style></head>
+     <body><div class="card"><h1>You've been unsubscribed</h1>
+     <p>${email.replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c]!))} will no longer receive emails from Blueprint Theology.</p>
+     <p style="font-size:13px;color:#9C9486;margin-top:24px">If this was a mistake, contact support@blueprinttheology.com.</p></div></body></html>`,
+    { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
   );
 }
 
@@ -365,6 +427,11 @@ async function handlePatchUser(request: Request, env: Env): Promise<Response> {
 }
 
 async function sendMagicLinkEmail(email: string, magicUrl: string, env: Env): Promise<void> {
+  const suppressed = await env.blueprint_bible_db.prepare(`SELECT email FROM unsubscribes WHERE email = ?`).bind(email).first();
+  if (suppressed) return;
+
+  const unsubToken = await signUnsubToken(email, 'magic-link', env.UNSUBSCRIBE_SECRET);
+  const unsubUrl = buildUnsubscribeUrl(email, 'magic-link', unsubToken);
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
@@ -372,11 +439,15 @@ async function sendMagicLinkEmail(email: string, magicUrl: string, env: Env): Pr
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      from: 'Blueprint Theology <support@blueprinttheology.com>',
+      from: SHARE_EMAIL_FROM,
       to: email,
       subject: 'Your sign-in link for Blueprint Theology',
       html: buildMagicLinkEmailHtml(magicUrl),
       text: buildMagicLinkEmailText(magicUrl),
+      headers: {
+        'List-Unsubscribe': `<${unsubUrl}>, <mailto:unsubscribe@blueprinttheology.com?subject=unsubscribe>`,
+        'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+      },
     }),
   });
   if (!response.ok) {
@@ -504,6 +575,17 @@ async function handleShare(request: Request, env: Env): Promise<Response> {
     return jsonResponse({ error: 'Rate limit exceeded' }, 429, { 'Retry-After': '86400' });
   }
 
+  const suppressed = await env.blueprint_bible_db.prepare(
+    `SELECT email FROM unsubscribes WHERE email = ?`
+  ).bind(recipientEmail).first();
+  if (suppressed) {
+    const id = crypto.randomUUID();
+    await env.blueprint_bible_db.prepare(
+      `INSERT INTO shares (id, share_type, sender_user_id, recipient_email, payload, subject, status, optional_message, created_at) VALUES (?, ?, ?, ?, ?, ?, 'suppressed', ?, ?)`
+    ).bind(id, type, user.id, recipientEmail, JSON.stringify(payload), '(suppressed)', optionalMessage || null, nowSeconds).run();
+    return jsonResponse({ id, status: 'sent' });
+  }
+
   let email: ShareEmail;
   if (type === 'note') {
     email = composeNoteShareEmail(user, recipientEmail, payload, optionalMessage);
@@ -517,6 +599,8 @@ async function handleShare(request: Request, env: Env): Promise<Response> {
     return errorResponse('Invalid share type', 400);
   }
   const id = crypto.randomUUID();
+  const unsubToken = await signUnsubToken(recipientEmail, id, env.UNSUBSCRIBE_SECRET);
+  const unsubUrl = buildUnsubscribeUrl(recipientEmail, id, unsubToken);
   await env.blueprint_bible_db.prepare(
     `INSERT INTO shares (id, share_type, sender_user_id, recipient_email, payload, subject, status, optional_message, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)`
   ).bind(id, type, user.id, recipientEmail, JSON.stringify(payload), email.subject, optionalMessage || null, nowSeconds).run();
@@ -528,12 +612,16 @@ async function handleShare(request: Request, env: Env): Promise<Response> {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      from: 'Blueprint Theology <support@blueprinttheology.com>',
+      from: SHARE_EMAIL_FROM,
       to: [recipientEmail],
       reply_to: user.email,
       subject: email.subject,
       html: email.html,
       text: email.text,
+      headers: {
+        'List-Unsubscribe': `<${unsubUrl}>, <mailto:unsubscribe@blueprinttheology.com?subject=unsubscribe>`,
+        'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+      },
     }),
   });
 
