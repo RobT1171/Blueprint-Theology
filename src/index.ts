@@ -116,7 +116,7 @@ export default {
 
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const path = new URL(request.url).pathname, method = request.method;
-  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.7-same-site-cookie' });
+  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.8-unified-sharing-foundation' });
 
   if (path === '/api/auth/request-magic-link' && method === 'POST') return handleRequestMagicLink(request, env);
   if (path === '/api/auth/verify-magic-link' && method === 'POST') return handleVerifyMagicLink(request, env);
@@ -124,6 +124,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (path === '/api/auth/login' && method === 'POST') return handleRetiredAuth();
   if (path === '/api/auth/logout' && method === 'POST') return handleLogout(request, env);
   if (path === '/api/auth/me' && method === 'GET') return handleGetMe(request, env);
+  if (path === '/api/share' && method === 'POST') return handleShare(request, env);
 
   if (path === '/api/users' && method === 'POST') return handleCreateUser(request, env);
       if (path.match(/^\/api\/users\/[\w-]+$/) && method === 'GET') return handleGetUser(path.split('/')[3], env);
@@ -131,6 +132,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       if (path === '/api/studies' && method === 'POST') return handleCreateStudy(request, env);
       if (path.match(/^\/api\/studies\/user\/[\w-]+$/) && method === 'GET') return handleGetStudies(path.split('/')[4], env);
+      if (path.match(/^\/api\/studies\/[\w-]+$/) && method === 'DELETE') return handleDeleteStudy(path.split('/')[3], request, env);
       if (path === '/api/generate-study' && method === 'POST') return handleGenerateStudy(request, env);
 
       // INTERACTIVE STUDY CHAT (Ax Engine)
@@ -145,11 +147,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       if (path === '/api/notes' && method === 'POST') return handleCreateNote(request, env);
       if (path.match(/^\/api\/notes\/user\/[\w-]+$/) && method === 'GET') return handleGetNotes(path.split('/')[4], env);
       if (path.match(/^\/api\/notes\/[\w-]+$/) && method === 'PUT') return handleUpdateNote(path.split('/')[3], request, env);
-      if (path.match(/^\/api\/notes\/[\w-]+$/) && method === 'DELETE') return handleDeleteNote(path.split('/')[3], env);
+      if (path.match(/^\/api\/notes\/[\w-]+$/) && method === 'DELETE') return handleDeleteNote(path.split('/')[3], request, env);
 
       if (path === '/api/tasks' && method === 'POST') return handleCreateTask(request, env);
       if (path.match(/^\/api\/tasks\/user\/[\w-]+$/) && method === 'GET') return handleGetTasks(path.split('/')[4], env);
-      if (path.match(/^\/api\/tasks\/[\w-]+\/toggle$/) && method === 'PUT') return handleToggleTask(path.split('/')[3], env);
+      if (path.match(/^\/api\/tasks\/[\w-]+\/toggle$/) && method === 'PUT') return handleToggleTask(path.split('/')[3], request, env);
+      if (path.match(/^\/api\/tasks\/[\w-]+$/) && method === 'DELETE') return handleDeleteTask(path.split('/')[3], request, env);
 
       if (path === '/api/xp' && method === 'POST') return handleAddXp(request, env);
       if (path.match(/^\/api\/xp\/user\/[\w-]+$/) && method === 'GET') return handleGetXpEvents(path.split('/')[4], env);
@@ -353,6 +356,151 @@ aibibletool.com
 }
 
 // ============================================================
+// SHARING
+// ============================================================
+type ShareType = 'note' | 'invite' | 'group_invite' | 'inspiration_card';
+type ShareEmail = { subject: string; html: string; text: string };
+
+const SHARE_TYPES = new Set<ShareType>(['note', 'invite', 'group_invite', 'inspiration_card']);
+const SHARE_HOURLY_LIMIT = 10;
+const SHARE_DAILY_LIMIT = 50;
+
+async function handleShare(request: Request, env: Env): Promise<Response> {
+  const user = await getUserFromToken(request, env);
+  if (!user) return errorResponse('Not authenticated', 401);
+
+  const body = await request.json().catch(() => ({})) as any;
+  const type = body?.type as ShareType;
+  const recipientEmail = (body?.recipient_email ?? '').toString().trim().toLowerCase();
+  const payload = body?.payload;
+  const optionalMessage = body?.optional_message == null ? undefined : body.optional_message.toString();
+
+  if (!SHARE_TYPES.has(type)) return errorResponse('Invalid share type', 400);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail)) return errorResponse('Invalid recipient email', 400);
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return errorResponse('Payload must be an object', 400);
+  if (optionalMessage && optionalMessage.length > 1000) return errorResponse('Optional message is too long', 400);
+
+  if (type !== 'note') return jsonResponse({ error: 'Type not yet implemented' }, 501);
+  if (!payload.note_id || !payload.snapshot_title || !payload.snapshot_content) {
+    return errorResponse('Note payload missing required fields', 400);
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const hourly = await env.blueprint_bible_db.prepare(
+    `SELECT COUNT(*) AS count FROM shares WHERE sender_user_id=? AND created_at >= ?`
+  ).bind(user.id, nowSeconds - 3600).first() as any;
+  if ((hourly?.count ?? 0) >= SHARE_HOURLY_LIMIT) {
+    return jsonResponse({ error: 'Rate limit exceeded' }, 429, { 'Retry-After': '3600' });
+  }
+
+  const daily = await env.blueprint_bible_db.prepare(
+    `SELECT COUNT(*) AS count FROM shares WHERE sender_user_id=? AND created_at >= ?`
+  ).bind(user.id, nowSeconds - 86400).first() as any;
+  if ((daily?.count ?? 0) >= SHARE_DAILY_LIMIT) {
+    return jsonResponse({ error: 'Rate limit exceeded' }, 429, { 'Retry-After': '86400' });
+  }
+
+  const email = composeNoteShareEmail(user, recipientEmail, payload, optionalMessage);
+  const id = crypto.randomUUID();
+  await env.blueprint_bible_db.prepare(
+    `INSERT INTO shares (id, share_type, sender_user_id, recipient_email, payload, subject, status, optional_message, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)`
+  ).bind(id, type, user.id, recipientEmail, JSON.stringify(payload), email.subject, optionalMessage || null, nowSeconds).run();
+
+  const resendResponse = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: 'Blueprint Theology <support@blueprinttheology.com>',
+      to: [recipientEmail],
+      reply_to: user.email,
+      subject: email.subject,
+      html: email.html,
+      text: email.text,
+    }),
+  });
+
+  if (!resendResponse.ok) {
+    const errorBody = await resendResponse.text().catch(() => '');
+    console.error('Share email send failed:', resendResponse.status, errorBody);
+    await env.blueprint_bible_db.prepare(`UPDATE shares SET status='failed' WHERE id=?`).bind(id).run();
+    return jsonResponse({ error: 'Email delivery failed' }, 502);
+  }
+
+  const resendBody = await resendResponse.json().catch(() => ({})) as any;
+  await env.blueprint_bible_db.prepare(
+    `UPDATE shares SET status='sent', resend_message_id=?, sent_at=? WHERE id=?`
+  ).bind(resendBody?.id || null, nowSeconds, id).run();
+
+  return jsonResponse({ id, status: 'sent' });
+}
+
+function composeNoteShareEmail(user: any, recipientEmail: string, payload: any, optionalMessage?: string): ShareEmail {
+  const senderName = user.name || 'A friend';
+  const senderAttribution = user.name || user.email;
+  const subject = `${senderName} shared a Bible study note with you`;
+  const title = escapeHtml(payload.snapshot_title.toString());
+  const content = escapeHtml(payload.snapshot_content.toString()).replace(/\n/g, '<br>');
+  const reference = payload.study_passage_reference ? escapeHtml(payload.study_passage_reference.toString()) : '';
+  const message = optionalMessage ? escapeHtml(optionalMessage) : '';
+  const attribution = escapeHtml(senderAttribution || recipientEmail);
+
+  const optionalMessageHtml = message
+    ? `<p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#5C6470;font-style:italic;">"${message}"<br><span style="font-style:normal;color:#5C6470;">&mdash; ${attribution}</span></p>`
+    : '';
+  const referenceHtml = reference
+    ? `<div style="font-size:12px;line-height:1.4;color:#5C6470;letter-spacing:0.5px;text-transform:uppercase;margin:0 0 14px 0;">${reference}</div>`
+    : '';
+
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><title>${escapeHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:#F5F5F5;font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,serif;color:#1F2933;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#F5F5F5;padding:32px 16px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;background:#FFFFFF;">
+        <tr><td style="background:#1E3A5F;color:#FFFFFF;font-size:18px;font-weight:600;padding:24px;">Blueprint Theology</td></tr>
+        <tr><td style="background:#FFFFFF;padding:28px 24px;">
+          ${optionalMessageHtml}
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#F5F5F5;border-radius:8px;">
+            <tr><td style="padding:24px;">
+              <h2 style="margin:0 0 12px 0;font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,serif;font-size:20px;line-height:1.35;font-weight:600;color:#1E3A5F;">${title}</h2>
+              ${referenceHtml}
+              <p style="margin:0;font-size:15px;line-height:1.6;color:#1F2933;">${content}</p>
+            </td></tr>
+          </table>
+        </td></tr>
+        <tr><td style="background:#FFFFFF;padding:0 24px 24px 24px;font-size:12px;line-height:1.5;color:#5C6470;">Sent via Blueprint Theology &middot; aibibletool.com</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+
+  const textParts = [
+    'Blueprint Theology',
+    '',
+    optionalMessage ? `"${optionalMessage}"\n-- ${senderAttribution}` : '',
+    payload.snapshot_title.toString(),
+    payload.study_passage_reference ? payload.study_passage_reference.toString() : '',
+    payload.snapshot_content.toString(),
+    '',
+    'Sent via Blueprint Theology · aibibletool.com',
+  ].filter(Boolean);
+
+  return { subject, html, text: textParts.join('\n\n') };
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ============================================================
 // DASHBOARD
 // ============================================================
 async function handleGetDashboard(userId: string, env: Env) {
@@ -381,7 +529,7 @@ async function handleUpdateUser(uid: string, r: Request, env: Env) { const b=awa
 // ============================================================
 // STUDIES + GENERATION
 // ============================================================
-async function handleCreateStudy(r: Request, env: Env) { const b=await r.json() as any; if(!b.id||!b.user_id) return errorResponse('Missing fields'); await env.blueprint_bible_db.prepare(`INSERT INTO studies (id,user_id,mode,input_reference,input_text,translation_preference,depth_mode) VALUES(?,?,?,?,?,?,?)`).bind(b.id,b.user_id,b.mode||'passage',b.input_reference||'',b.input_text||'',b.translation_preference||'ESV',b.depth_mode||'standard').run(); return jsonResponse({id:b.id,user_id:b.user_id,mode:b.mode,created_at:new Date().toISOString()}); }
+async function handleCreateStudy(r: Request, env: Env) { const user=await getUserFromToken(r,env); if(!user) return errorResponse('Not authenticated',401); const b=await r.json() as any; if(!b.id) return errorResponse('Missing fields'); await env.blueprint_bible_db.prepare(`INSERT INTO studies (id,user_id,mode,input_reference,input_text,translation_preference,depth_mode) VALUES(?,?,?,?,?,?,?)`).bind(b.id,user.id,b.mode||'passage',b.input_reference||'',b.input_text||'',b.translation_preference||'ESV',b.depth_mode||'standard').run(); return jsonResponse({id:b.id,user_id:user.id,mode:b.mode,created_at:new Date().toISOString()}); }
 async function handleGetStudies(uid: string, env: Env) { return jsonResponse((await env.blueprint_bible_db.prepare(`SELECT * FROM studies WHERE user_id=? ORDER BY created_at DESC`).bind(uid).all()).results||[]); }
 
 async function handleGenerateStudy(request: Request, env: Env) {
@@ -473,7 +621,7 @@ FIELD SPECIFICATION:
 - detected_arcs: only arcs the passage genuinely touches. Allowed values listed above. Empty array is acceptable if the passage truly fits none.
 
 DEPTH: ${depth.toUpperCase()}. ${budget}
-TRANSLATION: ${translation}.`;
+TRANSLATION: ${translation}. When the student picks AMP, Message, or TPT, scripture quotations must use that translation's distinctive voice — don't default to ESV-style. AMP requires bracketed amplifications after key words (e.g., "Shepherd [to feed, guide, and shield me]"). Message uses Eugene Peterson's earthy contemporary paraphrase voice — conversational, plainspoken, modern English without churchy formality. TPT uses Brian Simmons' expanded interpretive style with intimate God-language ("Yahweh", "Beloved"), often expanding phrasing to draw out felt meaning. Standard translations (ESV/NIV/NASB/KJV) need no special handling. The engine's teaching voice doesn't change; only how scripture itself is quoted.`;
 
   const userMessageParts: string[] = [];
   if (mode === 'topic') {
@@ -580,28 +728,30 @@ TRANSLATION: ${translation}.`;
 // ============================================================
 // SESSIONS + NOTES + TASKS + XP + ACTIVITY + ARCS
 // ============================================================
-async function handleCreateSession(r:Request,env:Env){const b=await r.json() as any;if(!b.id||!b.user_id||!b.study_id)return errorResponse('Missing fields');await env.blueprint_bible_db.prepare(`INSERT INTO study_sessions(id,user_id,study_id,generated_content)VALUES(?,?,?,?)`).bind(b.id,b.user_id,b.study_id,b.generated_content||'').run();return jsonResponse({id:b.id,user_id:b.user_id,study_id:b.study_id,completion_status:'not_started',created_at:new Date().toISOString()});}
-async function handleUpdateSession(sid:string,r:Request,env:Env){const b=await r.json() as any;const f:string[]=[],v:any[]=[];for(const[k,val] of Object.entries(b)){if(['completion_status','completion_score','head_complete','heart_complete','hand_complete','questions_answered','completed_at','generated_content'].includes(k)){f.push(`${k}=?`);v.push(val);}}if(!f.length)return errorResponse('No fields');v.push(sid);await env.blueprint_bible_db.prepare(`UPDATE study_sessions SET ${f.join(',')} WHERE id=?`).bind(...v).run();return jsonResponse({id:sid,updated:true});}
+async function handleCreateSession(r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);const b=await r.json() as any;if(!b.id||!b.study_id)return errorResponse('Missing fields');await env.blueprint_bible_db.prepare(`INSERT INTO study_sessions(id,user_id,study_id,generated_content)VALUES(?,?,?,?)`).bind(b.id,user.id,b.study_id,b.generated_content||'').run();return jsonResponse({id:b.id,user_id:user.id,study_id:b.study_id,completion_status:'not_started',created_at:new Date().toISOString()});}
+async function handleUpdateSession(sid:string,r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);const b=await r.json() as any;const f:string[]=[],v:any[]=[];for(const[k,val] of Object.entries(b)){if(['completion_status','completion_score','head_complete','heart_complete','hand_complete','questions_answered','completed_at','generated_content'].includes(k)){f.push(`${k}=?`);v.push(val);}}if(!f.length)return errorResponse('No fields');v.push(sid,user.id);await env.blueprint_bible_db.prepare(`UPDATE study_sessions SET ${f.join(',')} WHERE id=? AND user_id=?`).bind(...v).run();return jsonResponse({id:sid,updated:true});}
 async function handleGetSessions(uid:string,env:Env){return jsonResponse((await env.blueprint_bible_db.prepare(`SELECT * FROM study_sessions WHERE user_id=? ORDER BY created_at DESC`).bind(uid).all()).results||[]);}
 
-async function handleCreateNote(r:Request,env:Env){const b=await r.json() as any;if(!b.id||!b.user_id)return errorResponse('Missing');await env.blueprint_bible_db.prepare(`INSERT INTO notes(id,user_id,study_id,content,study_reference)VALUES(?,?,?,?,?)`).bind(b.id,b.user_id,b.study_id||'',b.content||'',b.study_reference||'').run();return jsonResponse({id:b.id,user_id:b.user_id,content:b.content,study_reference:b.study_reference,created_at:new Date().toISOString()});}
+async function handleCreateNote(r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);const b=await r.json() as any;if(!b.id)return errorResponse('Missing');await env.blueprint_bible_db.prepare(`INSERT INTO notes(id,user_id,study_id,content,study_reference)VALUES(?,?,?,?,?)`).bind(b.id,user.id,b.study_id||'',b.content||'',b.study_reference||'').run();return jsonResponse({id:b.id,user_id:user.id,content:b.content,study_reference:b.study_reference,created_at:new Date().toISOString()});}
 async function handleGetNotes(uid:string,env:Env){return jsonResponse((await env.blueprint_bible_db.prepare(`SELECT * FROM notes WHERE user_id=? ORDER BY created_at DESC`).bind(uid).all()).results||[]);}
-async function handleUpdateNote(nid:string,r:Request,env:Env){const b=await r.json() as any;await env.blueprint_bible_db.prepare(`UPDATE notes SET content=? WHERE id=?`).bind(b.content||'',nid).run();return jsonResponse({id:nid,updated:true});}
-async function handleDeleteNote(nid:string,env:Env){await env.blueprint_bible_db.prepare(`DELETE FROM notes WHERE id=?`).bind(nid).run();return jsonResponse({id:nid,deleted:true});}
+async function handleUpdateNote(nid:string,r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);const b=await r.json() as any;await env.blueprint_bible_db.prepare(`UPDATE notes SET content=? WHERE id=? AND user_id=?`).bind(b.content||'',nid,user.id).run();return jsonResponse({id:nid,updated:true});}
+async function handleDeleteNote(nid:string,r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);await env.blueprint_bible_db.prepare(`DELETE FROM notes WHERE id=? AND user_id=?`).bind(nid,user.id).run();return jsonResponse({id:nid,deleted:true});}
+async function handleDeleteStudy(sid:string,r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);await env.blueprint_bible_db.prepare(`DELETE FROM studies WHERE id=? AND user_id=?`).bind(sid,user.id).run();await env.blueprint_bible_db.prepare(`DELETE FROM study_sessions WHERE study_id=? AND user_id=?`).bind(sid,user.id).run();return jsonResponse({id:sid,deleted:true});}
+async function handleDeleteTask(tid:string,r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);await env.blueprint_bible_db.prepare(`DELETE FROM tasks WHERE id=? AND user_id=?`).bind(tid,user.id).run();return jsonResponse({id:tid,deleted:true});}
 
-async function handleCreateTask(r:Request,env:Env){const b=await r.json() as any;if(!b.id||!b.user_id)return errorResponse('Missing');await env.blueprint_bible_db.prepare(`INSERT INTO tasks(id,user_id,study_id,timeframe,task_text,study_reference)VALUES(?,?,?,?,?,?)`).bind(b.id,b.user_id,b.study_id||'',b.timeframe||'24hr',b.task_text||'',b.study_reference||'').run();return jsonResponse({id:b.id,user_id:b.user_id,timeframe:b.timeframe,task_text:b.task_text,is_completed:0,created_at:new Date().toISOString()});}
+async function handleCreateTask(r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);const b=await r.json() as any;if(!b.id)return errorResponse('Missing');await env.blueprint_bible_db.prepare(`INSERT INTO tasks(id,user_id,study_id,timeframe,task_text,study_reference)VALUES(?,?,?,?,?,?)`).bind(b.id,user.id,b.study_id||'',b.timeframe||'24hr',b.task_text||'',b.study_reference||'').run();return jsonResponse({id:b.id,user_id:user.id,timeframe:b.timeframe,task_text:b.task_text,is_completed:0,created_at:new Date().toISOString()});}
 async function handleGetTasks(uid:string,env:Env){return jsonResponse((await env.blueprint_bible_db.prepare(`SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC`).bind(uid).all()).results||[]);}
-async function handleToggleTask(tid:string,env:Env){const t=await env.blueprint_bible_db.prepare(`SELECT is_completed FROM tasks WHERE id=?`).bind(tid).first() as any;if(!t)return errorResponse('Not found',404);const ns=t.is_completed?0:1;const ca=ns?new Date().toISOString():null;await env.blueprint_bible_db.prepare(`UPDATE tasks SET is_completed=?,completed_at=? WHERE id=?`).bind(ns,ca,tid).run();return jsonResponse({id:tid,is_completed:ns,completed_at:ca});}
+async function handleToggleTask(tid:string,r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);const t=await env.blueprint_bible_db.prepare(`SELECT is_completed FROM tasks WHERE id=? AND user_id=?`).bind(tid,user.id).first() as any;if(!t)return errorResponse('Not found',404);const ns=t.is_completed?0:1;const ca=ns?new Date().toISOString():null;await env.blueprint_bible_db.prepare(`UPDATE tasks SET is_completed=?,completed_at=? WHERE id=? AND user_id=?`).bind(ns,ca,tid,user.id).run();return jsonResponse({id:tid,is_completed:ns,completed_at:ca});}
 
-async function handleAddXp(r:Request,env:Env){const b=await r.json() as any;if(!b.user_id||!b.amount)return errorResponse('Missing');await env.blueprint_bible_db.prepare(`INSERT INTO xp_events(user_id,amount,action,study_id)VALUES(?,?,?,?)`).bind(b.user_id,b.amount,b.action||'',b.study_id||null).run();await env.blueprint_bible_db.prepare(`UPDATE user_profiles SET total_xp=total_xp+?,updated_at=? WHERE id=?`).bind(b.amount,new Date().toISOString(),b.user_id).run();const u=await env.blueprint_bible_db.prepare(`SELECT total_xp FROM user_profiles WHERE id=?`).bind(b.user_id).first() as any;const xp=u?.total_xp||0;const lv=calculateLevel(xp);await env.blueprint_bible_db.prepare(`UPDATE user_profiles SET level=? WHERE id=?`).bind(lv,b.user_id).run();return jsonResponse({user_id:b.user_id,total_xp:xp,level:lv,added:b.amount});}
+async function handleAddXp(r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);const b=await r.json() as any;if(!b.amount)return errorResponse('Missing');await env.blueprint_bible_db.prepare(`INSERT INTO xp_events(user_id,amount,action,study_id)VALUES(?,?,?,?)`).bind(user.id,b.amount,b.action||'',b.study_id||null).run();await env.blueprint_bible_db.prepare(`UPDATE user_profiles SET total_xp=total_xp+?,updated_at=? WHERE id=?`).bind(b.amount,new Date().toISOString(),user.id).run();const u=await env.blueprint_bible_db.prepare(`SELECT total_xp FROM user_profiles WHERE id=?`).bind(user.id).first() as any;const xp=u?.total_xp||0;const lv=calculateLevel(xp);await env.blueprint_bible_db.prepare(`UPDATE user_profiles SET level=? WHERE id=?`).bind(lv,user.id).run();return jsonResponse({user_id:user.id,total_xp:xp,level:lv,added:b.amount});}
 async function handleGetXpEvents(uid:string,env:Env){return jsonResponse((await env.blueprint_bible_db.prepare(`SELECT * FROM xp_events WHERE user_id=? ORDER BY created_at DESC LIMIT 100`).bind(uid).all()).results||[]);}
 function calculateLevel(xp:number):number{const t=[0,300,800,1600,2800,4500,7000];for(let i=t.length-1;i>=0;i--){if(xp>=t[i])return i+1;}return 1;}
 
-async function handleRecordActivity(r:Request,env:Env){const b=await r.json() as any;if(!b.user_id)return errorResponse('Missing');const today=new Date().toISOString().split('T')[0];await env.blueprint_bible_db.prepare(`INSERT OR IGNORE INTO study_activity(user_id,activity_date,study_id,session_id,activity_type)VALUES(?,?,?,?,?)`).bind(b.user_id,today,b.study_id||null,b.session_id||null,b.activity_type||'study_completed').run();const{results}=await env.blueprint_bible_db.prepare(`SELECT DISTINCT activity_date FROM study_activity WHERE user_id=? ORDER BY activity_date DESC LIMIT 90`).bind(b.user_id).all();const s=calculateStreak(results?.map((r:any)=>r.activity_date)||[]);await env.blueprint_bible_db.prepare(`UPDATE user_profiles SET streak_count=?,updated_at=? WHERE id=?`).bind(s,new Date().toISOString(),b.user_id).run();return jsonResponse({user_id:b.user_id,streak:s,activity_date:today});}
+async function handleRecordActivity(r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);const b=await r.json() as any;const today=new Date().toISOString().split('T')[0];await env.blueprint_bible_db.prepare(`INSERT OR IGNORE INTO study_activity(user_id,activity_date,study_id,session_id,activity_type)VALUES(?,?,?,?,?)`).bind(user.id,today,b.study_id||null,b.session_id||null,b.activity_type||'study_completed').run();const{results}=await env.blueprint_bible_db.prepare(`SELECT DISTINCT activity_date FROM study_activity WHERE user_id=? ORDER BY activity_date DESC LIMIT 90`).bind(user.id).all();const s=calculateStreak(results?.map((r:any)=>r.activity_date)||[]);await env.blueprint_bible_db.prepare(`UPDATE user_profiles SET streak_count=?,updated_at=? WHERE id=?`).bind(s,new Date().toISOString(),user.id).run();return jsonResponse({user_id:user.id,streak:s,activity_date:today});}
 async function handleGetActivity(uid:string,env:Env){return jsonResponse((await env.blueprint_bible_db.prepare(`SELECT activity_date,activity_type FROM study_activity WHERE user_id=? ORDER BY activity_date DESC LIMIT 90`).bind(uid).all()).results||[]);}
 function calculateStreak(dates:string[]):number{if(!dates.length)return 0;const t=new Date().toISOString().split('T')[0];const y=new Date(Date.now()-86400000).toISOString().split('T')[0];if(dates[0]!==t&&dates[0]!==y)return 0;let s=0;let c=new Date(dates[0]);for(const d of dates){if(d===c.toISOString().split('T')[0]){s++;c.setDate(c.getDate()-1);}else break;}return s;}
 
-async function handleRecordArcs(r:Request,env:Env){const b=await r.json() as any;if(!b.user_id||!b.arcs?.length)return errorResponse('Missing');const st=env.blueprint_bible_db.prepare(`INSERT INTO formation_arc_exposures(user_id,arc_key,study_id,session_id)VALUES(?,?,?,?)`);await env.blueprint_bible_db.batch(b.arcs.map((a:string)=>st.bind(b.user_id,a,b.study_id||null,b.session_id||null)));return jsonResponse({user_id:b.user_id,arcs_recorded:b.arcs.length});}
+async function handleRecordArcs(r:Request,env:Env){const user=await getUserFromToken(r,env);if(!user)return errorResponse('Not authenticated',401);const b=await r.json() as any;if(!b.arcs?.length)return errorResponse('Missing');const st=env.blueprint_bible_db.prepare(`INSERT INTO formation_arc_exposures(user_id,arc_key,study_id,session_id)VALUES(?,?,?,?)`);await env.blueprint_bible_db.batch(b.arcs.map((a:string)=>st.bind(user.id,a,b.study_id||null,b.session_id||null)));return jsonResponse({user_id:user.id,arcs_recorded:b.arcs.length});}
 async function handleGetArcs(uid:string,env:Env){return jsonResponse((await env.blueprint_bible_db.prepare(`SELECT arc_key,COUNT(*) as count FROM formation_arc_exposures WHERE user_id=? GROUP BY arc_key`).bind(uid).all()).results||[]);}
 
 // ============================================================
@@ -624,14 +774,12 @@ async function handleGetMyGroups(request: Request, env: Env) {
   return handleGetUserGroups(user.id, env);
 }
 
-// FIXED: POST /api/groups — reads owner_id from auth token if not in body
 async function handleCreateGroup(request: Request, env: Env) {
   const user = await getUserFromToken(request, env);
+  if (!user) return errorResponse('Not authenticated', 401);
   const b = await request.json() as any;
-
-  // Use owner_id from body if provided, otherwise from auth token
-  const owner_id = b.owner_id || user?.id;
-  if (!b.name || !owner_id) return errorResponse('Group name required (and you must be logged in)');
+  const owner_id = user.id;
+  if (!b.name) return errorResponse('Group name required');
 
   const id = crypto.randomUUID();
   const invite_code = generateInviteCode();
@@ -678,14 +826,11 @@ async function handleGetGroupByInvite(inviteCode: string, env: Env) {
 }
 
 async function handleJoinGroup(request: Request, env: Env) {
+  const user = await getUserFromToken(request, env);
+  if (!user) return errorResponse('Not authenticated', 401);
   const b = await request.json() as any;
-  // Support auth-token-based join (no user_id in body needed)
-  let userId = b.user_id;
-  if (!userId) {
-    const user = await getUserFromToken(request, env);
-    userId = user?.id;
-  }
-  if (!b.invite_code || !userId) return errorResponse('Invite code required (and you must be logged in)');
+  const userId = user.id;
+  if (!b.invite_code) return errorResponse('Invite code required');
 
   const group = await env.blueprint_bible_db.prepare(
     `SELECT id, max_members FROM groups WHERE invite_code = ? AND is_active = 1`
@@ -740,20 +885,22 @@ async function handleGetGroupMembers(groupId: string, env: Env) {
 }
 
 async function handleShareStudy(groupId: string, request: Request, env: Env) {
+  const user = await getUserFromToken(request, env);
+  if (!user) return errorResponse('Not authenticated', 401);
   const b = await request.json() as any;
-  if (!b.study_id || !b.shared_by) return errorResponse('Study ID and sharer required');
+  if (!b.study_id) return errorResponse('Study ID required');
 
   const member = await env.blueprint_bible_db.prepare(
     `SELECT id FROM group_members WHERE group_id = ? AND user_id = ?`
-  ).bind(groupId, b.shared_by).first();
+  ).bind(groupId, user.id).first();
   if (!member) return errorResponse('You must be a member to share studies');
 
   const id = crypto.randomUUID();
   await env.blueprint_bible_db.prepare(
     `INSERT INTO group_studies (id, group_id, study_id, session_id, shared_by, title, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).bind(id, groupId, b.study_id, b.session_id || null, b.shared_by, b.title || '', new Date().toISOString()).run();
+  ).bind(id, groupId, b.study_id, b.session_id || null, user.id, b.title || '', new Date().toISOString()).run();
 
-  return jsonResponse({ id, group_id: groupId, study_id: b.study_id, shared_by: b.shared_by, title: b.title, shared: true });
+  return jsonResponse({ id, group_id: groupId, study_id: b.study_id, shared_by: user.id, title: b.title, shared: true });
 }
 
 async function handleGetGroupStudies(groupId: string, env: Env) {
@@ -771,12 +918,14 @@ async function handleGetGroupStudies(groupId: string, env: Env) {
 }
 
 async function handlePostDiscussion(groupId: string, request: Request, env: Env) {
+  const user = await getUserFromToken(request, env);
+  if (!user) return errorResponse('Not authenticated', 401);
   const b = await request.json() as any;
-  if (!b.user_id || !b.content) return errorResponse('User ID and content required');
+  if (!b.content) return errorResponse('Content required');
 
   const member = await env.blueprint_bible_db.prepare(
     `SELECT id FROM group_members WHERE group_id = ? AND user_id = ?`
-  ).bind(groupId, b.user_id).first();
+  ).bind(groupId, user.id).first();
   if (!member) return errorResponse('You must be a member to post');
 
   if (b.content.length > 20) {
@@ -785,11 +934,12 @@ async function handlePostDiscussion(groupId: string, request: Request, env: Env)
   }
 
   const id = crypto.randomUUID();
+  const userName = user.name || b.user_name || '';
   await env.blueprint_bible_db.prepare(
     `INSERT INTO group_discussions (id, group_id, study_id, user_id, user_name, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).bind(id, groupId, b.study_id || null, b.user_id, b.user_name || '', b.content, new Date().toISOString()).run();
+  ).bind(id, groupId, b.study_id || null, user.id, userName, b.content, new Date().toISOString()).run();
 
-  return jsonResponse({ id, group_id: groupId, user_id: b.user_id, user_name: b.user_name, content: b.content, created_at: new Date().toISOString() });
+  return jsonResponse({ id, group_id: groupId, user_id: user.id, user_name: userName, content: b.content, created_at: new Date().toISOString() });
 }
 
 async function handleGetDiscussions(groupId: string, url: URL, env: Env) {
@@ -803,12 +953,12 @@ async function handleGetDiscussions(groupId: string, url: URL, env: Env) {
 }
 
 async function handleLeaveGroup(groupId: string, request: Request, env: Env) {
-  const b = await request.json() as any;
-  if (!b.user_id) return errorResponse('User ID required');
+  const user = await getUserFromToken(request, env);
+  if (!user) return errorResponse('Not authenticated', 401);
   const group = await env.blueprint_bible_db.prepare(`SELECT owner_id FROM groups WHERE id = ?`).bind(groupId).first() as any;
-  if (group?.owner_id === b.user_id) return errorResponse('The group leader cannot leave. Transfer leadership or delete the group.');
-  await env.blueprint_bible_db.prepare(`DELETE FROM group_members WHERE group_id = ? AND user_id = ?`).bind(groupId, b.user_id).run();
-  return jsonResponse({ group_id: groupId, user_id: b.user_id, left: true });
+  if (group?.owner_id === user.id) return errorResponse('The group leader cannot leave. Transfer leadership or delete the group.');
+  await env.blueprint_bible_db.prepare(`DELETE FROM group_members WHERE group_id = ? AND user_id = ?`).bind(groupId, user.id).run();
+  return jsonResponse({ group_id: groupId, user_id: user.id, left: true });
 }
 
 // ============================================================
