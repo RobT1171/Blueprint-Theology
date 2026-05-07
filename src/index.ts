@@ -8,6 +8,7 @@ export interface Env {
   OPENAI_API_KEY: string;
   RESEND_API_KEY: string;
   UNSUBSCRIBE_SECRET: string;
+  GHL_WEBHOOK_URL: string;
   FRONTEND_URL: string;
 }
 
@@ -101,7 +102,7 @@ async function moderateContent(text: string, apiKey: string): Promise<{ flagged:
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const origin = request.headers.get('Origin');
     const cors = buildCorsHeaders(origin);
     if (request.method === 'OPTIONS') {
@@ -109,7 +110,7 @@ export default {
     }
     let response: Response;
     try {
-      response = await handleRequest(request, env);
+      response = await handleRequest(request, env, ctx);
     } catch (err: any) {
       response = errorResponse(err.message || 'Internal server error', 500);
     }
@@ -117,12 +118,12 @@ export default {
   },
 };
 
-async function handleRequest(request: Request, env: Env): Promise<Response> {
+async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const path = new URL(request.url).pathname, method = request.method;
-  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.13-cors-patch' });
+  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.14-ghl-capture' });
 
   if (path === '/api/auth/request-magic-link' && method === 'POST') return handleRequestMagicLink(request, env);
-  if (path === '/api/auth/verify-magic-link' && method === 'POST') return handleVerifyMagicLink(request, env);
+  if (path === '/api/auth/verify-magic-link' && method === 'POST') return handleVerifyMagicLink(request, env, ctx);
   if (path === '/api/auth/signup' && method === 'POST') return handleRetiredAuth();
   if (path === '/api/auth/login' && method === 'POST') return handleRetiredAuth();
   if (path === '/api/auth/logout' && method === 'POST') return handleLogout(request, env);
@@ -257,7 +258,7 @@ function buildUnsubscribeUrl(email: string, shareId: string, token: string): str
   return `https://api.aibibletool.com/api/unsubscribe?${params.toString()}`;
 }
 
-async function handleVerifyMagicLink(request: Request, env: Env): Promise<Response> {
+async function handleVerifyMagicLink(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const body = await request.json().catch(() => ({})) as any;
   const token = (body?.token ?? '').toString().trim();
   if (!token) return errorResponse('Token required', 400);
@@ -279,6 +280,7 @@ async function handleVerifyMagicLink(request: Request, env: Env): Promise<Respon
   }
 
   const email = (row.email || '').toString().toLowerCase();
+  let isNewSignup = false;
   let user = await env.blueprint_bible_db.prepare(
     `SELECT id, email FROM user_profiles WHERE email = ?`
   ).bind(email).first() as any;
@@ -289,6 +291,7 @@ async function handleVerifyMagicLink(request: Request, env: Env): Promise<Respon
       `INSERT INTO user_profiles (id, name, email) VALUES (?, ?, ?)`
     ).bind(newId, '', email).run();
     user = { id: newId, email };
+    isNewSignup = true;
   }
 
   const sessionToken = generateToken();
@@ -297,11 +300,25 @@ async function handleVerifyMagicLink(request: Request, env: Env): Promise<Respon
     `INSERT INTO auth_sessions (id, user_id, token, expires_at) VALUES (?, ?, ?, ?)`
   ).bind(crypto.randomUUID(), user.id, sessionToken, expiresAt).run();
 
-  return jsonResponse(
+  const response = jsonResponse(
     { user: { id: user.id, email: user.email } },
     200,
     { 'Set-Cookie': buildSessionCookie(sessionToken) }
   );
+
+  if (isNewSignup) {
+    const referer = request.headers.get('Referer') || '';
+    let source = 'magic_link';
+    if (referer.includes('aibibletool.com')) source = 'organic';
+
+    ctx.waitUntil(
+      notifyGhlNewSignup(user, source, env).catch((err) => {
+        console.error('GHL notify catch:', err);
+      })
+    );
+  }
+
+  return response;
 }
 
 async function handleUnsubscribe(request: Request, env: Env): Promise<Response> {
@@ -334,6 +351,55 @@ async function handleUnsubscribe(request: Request, env: Env): Promise<Response> 
      <p style="font-size:13px;color:#9C9486;margin-top:24px">If this was a mistake, contact support@blueprinttheology.com.</p></div></body></html>`,
     { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
   );
+}
+
+async function notifyGhlNewSignup(
+  user: { id: string; email: string; name?: string },
+  source: string,
+  env: Env
+): Promise<void> {
+  const logId = crypto.randomUUID();
+  const payload = {
+    email: user.email,
+    name: user.name || '',
+    tag: 'Blueprint Theology',
+    signup_timestamp: new Date().toISOString(),
+    source,
+  };
+
+  if (!env.GHL_WEBHOOK_URL) {
+    await env.blueprint_bible_db.prepare(
+      `INSERT INTO ghl_webhook_log (id, user_id, email, status, error_message) VALUES (?, ?, ?, 'failed', 'GHL_WEBHOOK_URL not configured')`
+    ).bind(logId, user.id, user.email).run();
+    return;
+  }
+
+  try {
+    const response = await fetch(env.GHL_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (response.ok) {
+      await env.blueprint_bible_db.prepare(
+        `INSERT INTO ghl_webhook_log (id, user_id, email, status, http_status) VALUES (?, ?, ?, 'sent', ?)`
+      ).bind(logId, user.id, user.email, response.status).run();
+    } else {
+      const body = await response.text().catch(() => '');
+      await env.blueprint_bible_db.prepare(
+        `INSERT INTO ghl_webhook_log (id, user_id, email, status, http_status, error_message) VALUES (?, ?, ?, 'failed', ?, ?)`
+      ).bind(logId, user.id, user.email, response.status, body.slice(0, 500)).run();
+      console.error('GHL webhook returned non-2xx:', response.status, body);
+    }
+  } catch (err: any) {
+    const message = err?.message || String(err);
+    await env.blueprint_bible_db.prepare(
+      `INSERT INTO ghl_webhook_log (id, user_id, email, status, error_message) VALUES (?, ?, ?, 'failed', ?)`
+    ).bind(logId, user.id, user.email, message.slice(0, 500)).run();
+    console.error('GHL webhook fetch failed:', message);
+  }
 }
 
 async function handleLogout(request: Request, env: Env): Promise<Response> {
