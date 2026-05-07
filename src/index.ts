@@ -55,6 +55,7 @@ const MAGIC_LINK_TTL_MINUTES = 15;
 const MAGIC_LINK_RATE_WINDOW_MINUTES = 10;
 const MAGIC_LINK_RATE_LIMIT = 3;
 const RETIRED_AUTH_MESSAGE = 'Password authentication has been replaced. Sign in via magic link at https://aibibletool.com/auth/sign-in';
+const USER_PROFILE_SELECT = `id,name,email,subscription_plan,total_xp,level,streak_count,longest_streak,studies_completed,tasks_completed,engagement_score,twitter_handle,instagram_handle,linkedin_handle,facebook_handle,theme_preference,default_translation,default_depth,created_at`;
 
 function parseCookies(header: string | null): Record<string, string> {
   const out: Record<string, string> = {};
@@ -89,7 +90,7 @@ async function getUserFromToken(request: Request, env: Env): Promise<any | null>
   if (!token) return null;
   const s = await env.blueprint_bible_db.prepare(`SELECT user_id FROM auth_sessions WHERE token=? AND (expires_at IS NULL OR expires_at > datetime('now'))`).bind(token).first() as any;
   if (!s) return null;
-  return await env.blueprint_bible_db.prepare(`SELECT id,name,email,subscription_plan,total_xp,level,streak_count,longest_streak,studies_completed,tasks_completed,engagement_score,created_at FROM user_profiles WHERE id=?`).bind(s.user_id).first();
+  return await env.blueprint_bible_db.prepare(`SELECT ${USER_PROFILE_SELECT} FROM user_profiles WHERE id=?`).bind(s.user_id).first();
 }
 
 async function moderateContent(text: string, apiKey: string): Promise<{ flagged: boolean; reason: string }> {
@@ -116,7 +117,7 @@ export default {
 
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const path = new URL(request.url).pathname, method = request.method;
-  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.9-sharing-composers' });
+  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.10-user-profile-patch' });
 
   if (path === '/api/auth/request-magic-link' && method === 'POST') return handleRequestMagicLink(request, env);
   if (path === '/api/auth/verify-magic-link' && method === 'POST') return handleVerifyMagicLink(request, env);
@@ -127,6 +128,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (path === '/api/share' && method === 'POST') return handleShare(request, env);
 
   if (path === '/api/users' && method === 'POST') return handleCreateUser(request, env);
+  if (path === '/api/users/me' && method === 'PATCH') return handlePatchUser(request, env);
       if (path.match(/^\/api\/users\/[\w-]+$/) && method === 'GET') return handleGetUser(path.split('/')[3], env);
       if (path.match(/^\/api\/users\/[\w-]+$/) && method === 'PUT') return handleUpdateUser(path.split('/')[3], request, env);
 
@@ -283,6 +285,82 @@ async function handleGetMe(request: Request, env: Env): Promise<Response> {
   const u = await getUserFromToken(request, env);
   if (!u) return errorResponse('Not authenticated', 401);
   return jsonResponse(u);
+}
+
+async function handlePatchUser(request: Request, env: Env): Promise<Response> {
+  const user = await getUserFromToken(request, env);
+  if (!user) return errorResponse('Not authenticated', 401);
+
+  let body: any;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Empty or invalid body', 400);
+  }
+
+  if (!body || typeof body !== 'object' || Array.isArray(body) || !Object.keys(body).length) {
+    return errorResponse('Empty or invalid body', 400);
+  }
+
+  const allowed = new Set(['name', 'twitter_handle', 'instagram_handle', 'linkedin_handle', 'facebook_handle', 'theme_preference', 'default_translation', 'default_depth']);
+  const unknown = Object.keys(body).filter((k) => !allowed.has(k));
+  if (unknown.length) return errorResponse(`Unknown fields: ${unknown.join(', ')}`, 400);
+
+  const updates: string[] = [];
+  const values: any[] = [];
+  const now = new Date().toISOString();
+
+  if (Object.prototype.hasOwnProperty.call(body, 'name')) {
+    if (typeof body.name !== 'string') return errorResponse('name must be a string', 400);
+    const name = body.name.trim();
+    if (!name) return errorResponse('name cannot be empty', 400);
+    if (name.length > 100) return errorResponse('name must be 100 chars or fewer', 400);
+    updates.push('name=?');
+    values.push(name);
+  }
+
+  for (const field of ['twitter_handle', 'instagram_handle', 'linkedin_handle', 'facebook_handle'] as const) {
+    if (Object.prototype.hasOwnProperty.call(body, field)) {
+      const value = body[field];
+      if (value !== null && typeof value !== 'string') return errorResponse(`${field} must be a string or null`, 400);
+      if (typeof value === 'string' && value.length > 200) return errorResponse(`${field} must be 200 chars or fewer`, 400);
+      updates.push(`${field}=?`);
+      values.push(value);
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, 'theme_preference')) {
+    if (typeof body.theme_preference !== 'string' || !['light', 'dark', 'system'].includes(body.theme_preference)) {
+      return errorResponse('theme_preference must be one of light, dark, system', 400);
+    }
+    updates.push('theme_preference=?');
+    values.push(body.theme_preference);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, 'default_translation')) {
+    if (typeof body.default_translation !== 'string' || !['ESV', 'NIV', 'NASB', 'KJV', 'NLT'].includes(body.default_translation)) {
+      return errorResponse('default_translation must be one of ESV, NIV, NASB, KJV, NLT', 400);
+    }
+    updates.push('default_translation=?');
+    values.push(body.default_translation);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, 'default_depth')) {
+    if (typeof body.default_depth !== 'string' || !['quick', 'standard', 'deep'].includes(body.default_depth)) {
+      return errorResponse('default_depth must be one of quick, standard, deep', 400);
+    }
+    updates.push('default_depth=?');
+    values.push(body.default_depth);
+  }
+
+  if (!updates.length) return errorResponse('Empty or invalid body', 400);
+
+  updates.push('updated_at=?');
+  values.push(now, user.id);
+  await env.blueprint_bible_db.prepare(`UPDATE user_profiles SET ${updates.join(', ')} WHERE id=?`).bind(...values).run();
+
+  const updated = await env.blueprint_bible_db.prepare(`SELECT ${USER_PROFILE_SELECT} FROM user_profiles WHERE id=?`).bind(user.id).first();
+  return jsonResponse({ user: updated });
 }
 
 async function sendMagicLinkEmail(email: string, magicUrl: string, env: Env): Promise<void> {
@@ -709,7 +787,7 @@ function escapeHtml(value: string): string {
 // ============================================================
 async function handleGetDashboard(userId: string, env: Env) {
   const [u,st,se,n,t,a,ar,x] = await Promise.all([
-    env.blueprint_bible_db.prepare(`SELECT id,name,email,subscription_plan,total_xp,level,streak_count,longest_streak,studies_completed,tasks_completed,engagement_score,created_at FROM user_profiles WHERE id=?`).bind(userId).first(),
+    env.blueprint_bible_db.prepare(`SELECT ${USER_PROFILE_SELECT} FROM user_profiles WHERE id=?`).bind(userId).first(),
     env.blueprint_bible_db.prepare(`SELECT * FROM studies WHERE user_id=? ORDER BY created_at DESC LIMIT 50`).bind(userId).all(),
     env.blueprint_bible_db.prepare(`SELECT * FROM study_sessions WHERE user_id=? ORDER BY created_at DESC LIMIT 50`).bind(userId).all(),
     env.blueprint_bible_db.prepare(`SELECT * FROM notes WHERE user_id=? ORDER BY created_at DESC LIMIT 100`).bind(userId).all(),
@@ -727,7 +805,7 @@ async function handleGetDashboard(userId: string, env: Env) {
 // USERS
 // ============================================================
 async function handleCreateUser(r: Request, env: Env) { const b=await r.json() as any; if(!b.id) return errorResponse('User ID required'); await env.blueprint_bible_db.prepare(`INSERT OR IGNORE INTO user_profiles (id,name,email) VALUES(?,?,?)`).bind(b.id,b.name||'',b.email||'').run(); return jsonResponse(await env.blueprint_bible_db.prepare(`SELECT * FROM user_profiles WHERE id=?`).bind(b.id).first()); }
-async function handleGetUser(uid: string, env: Env) { const u=await env.blueprint_bible_db.prepare(`SELECT id,name,email,subscription_plan,total_xp,level,streak_count,longest_streak,studies_completed,tasks_completed,engagement_score,created_at FROM user_profiles WHERE id=?`).bind(uid).first(); if(!u) return errorResponse('Not found',404); return jsonResponse(u); }
+async function handleGetUser(uid: string, env: Env) { const u=await env.blueprint_bible_db.prepare(`SELECT ${USER_PROFILE_SELECT} FROM user_profiles WHERE id=?`).bind(uid).first(); if(!u) return errorResponse('Not found',404); return jsonResponse(u); }
 async function handleUpdateUser(uid: string, r: Request, env: Env) { const b=await r.json() as any; const f:string[]=[],v:any[]=[]; for(const[k,val] of Object.entries(b)){if(['name','email','subscription_plan','total_xp','level','streak_count','longest_streak','studies_completed','tasks_completed','engagement_score'].includes(k)){f.push(`${k}=?`);v.push(val);}} if(!f.length) return errorResponse('No fields'); f.push(`updated_at=?`);v.push(new Date().toISOString());v.push(uid); await env.blueprint_bible_db.prepare(`UPDATE user_profiles SET ${f.join(',')} WHERE id=?`).bind(...v).run(); return jsonResponse(await env.blueprint_bible_db.prepare(`SELECT id,name,email,subscription_plan,total_xp,level,streak_count,longest_streak,studies_completed,tasks_completed,engagement_score,created_at FROM user_profiles WHERE id=?`).bind(uid).first()); }
 
 // ============================================================
