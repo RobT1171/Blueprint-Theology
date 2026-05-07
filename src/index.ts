@@ -116,7 +116,7 @@ export default {
 
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const path = new URL(request.url).pathname, method = request.method;
-  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.8-unified-sharing-foundation' });
+  if (path === '/api/health' && method === 'GET') return jsonResponse({ status: 'ok', version: 'v4.9-sharing-composers' });
 
   if (path === '/api/auth/request-magic-link' && method === 'POST') return handleRequestMagicLink(request, env);
   if (path === '/api/auth/verify-magic-link' && method === 'POST') return handleVerifyMagicLink(request, env);
@@ -380,9 +380,34 @@ async function handleShare(request: Request, env: Env): Promise<Response> {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return errorResponse('Payload must be an object', 400);
   if (optionalMessage && optionalMessage.length > 1000) return errorResponse('Optional message is too long', 400);
 
-  if (type !== 'note') return jsonResponse({ error: 'Type not yet implemented' }, 501);
-  if (!payload.note_id || !payload.snapshot_title || !payload.snapshot_content) {
+  if (type === 'note' && (!payload.note_id || !payload.snapshot_title || !payload.snapshot_content)) {
     return errorResponse('Note payload missing required fields', 400);
+  } else if (type === 'group_invite') {
+    if (!payload.group_id || typeof payload.group_id !== 'string' || !payload.group_id.trim()) {
+      return errorResponse('Group invite payload missing required field: group_id', 400);
+    }
+    if (!payload.group_name || typeof payload.group_name !== 'string' || !payload.group_name.trim()) {
+      return errorResponse('Group invite payload missing required field: group_name', 400);
+    }
+    if (!payload.invite_code || typeof payload.invite_code !== 'string' || !payload.invite_code.trim()) {
+      return errorResponse('Group invite payload missing required field: invite_code', 400);
+    }
+    if (payload.group_description && (typeof payload.group_description !== 'string' || payload.group_description.length > 500)) {
+      return errorResponse('Group description must be a string under 500 chars', 400);
+    }
+  } else if (type === 'inspiration_card') {
+    if (!payload.verse_reference || typeof payload.verse_reference !== 'string' || !payload.verse_reference.trim()) {
+      return errorResponse('Inspiration card payload missing required field: verse_reference', 400);
+    }
+    if (!payload.verse_text || typeof payload.verse_text !== 'string' || !payload.verse_text.trim() || payload.verse_text.length > 2000) {
+      return errorResponse('Inspiration card payload missing or too-long verse_text (max 2000 chars)', 400);
+    }
+    if (!payload.reflection_text || typeof payload.reflection_text !== 'string' || !payload.reflection_text.trim() || payload.reflection_text.length > 2000) {
+      return errorResponse('Inspiration card payload missing or too-long reflection_text (max 2000 chars)', 400);
+    }
+    if (payload.card_image_url && (typeof payload.card_image_url !== 'string' || !payload.card_image_url.startsWith('https://'))) {
+      return errorResponse('Card image URL must be an https URL', 400);
+    }
   }
 
   const nowSeconds = Math.floor(Date.now() / 1000);
@@ -400,7 +425,18 @@ async function handleShare(request: Request, env: Env): Promise<Response> {
     return jsonResponse({ error: 'Rate limit exceeded' }, 429, { 'Retry-After': '86400' });
   }
 
-  const email = composeNoteShareEmail(user, recipientEmail, payload, optionalMessage);
+  let email: ShareEmail;
+  if (type === 'note') {
+    email = composeNoteShareEmail(user, recipientEmail, payload, optionalMessage);
+  } else if (type === 'invite') {
+    email = composeInviteEmail(user, recipientEmail, payload, optionalMessage);
+  } else if (type === 'group_invite') {
+    email = composeGroupInviteEmail(user, recipientEmail, payload, optionalMessage);
+  } else if (type === 'inspiration_card') {
+    email = composeInspirationCardEmail(user, recipientEmail, payload, optionalMessage);
+  } else {
+    return errorResponse('Invalid share type', 400);
+  }
   const id = crypto.randomUUID();
   await env.blueprint_bible_db.prepare(
     `INSERT INTO shares (id, share_type, sender_user_id, recipient_email, payload, subject, status, optional_message, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)`
@@ -484,6 +520,174 @@ function composeNoteShareEmail(user: any, recipientEmail: string, payload: any, 
     payload.snapshot_title.toString(),
     payload.study_passage_reference ? payload.study_passage_reference.toString() : '',
     payload.snapshot_content.toString(),
+    '',
+    'Sent via Blueprint Theology · aibibletool.com',
+  ].filter(Boolean);
+
+  return { subject, html, text: textParts.join('\n\n') };
+}
+
+function composeInviteEmail(user: any, recipientEmail: string, payload: any, optionalMessage?: string): ShareEmail {
+  const senderName = user.name || 'A friend';
+  const senderAttribution = user.name || user.email;
+  const subject = `${senderName} invited you to Blueprint Theology`;
+  const message = optionalMessage ? escapeHtml(optionalMessage) : '';
+  const attribution = escapeHtml(senderAttribution || recipientEmail);
+  const signInUrl = 'https://aibibletool.com/auth/sign-in';
+
+  const optionalMessageHtml = message
+    ? `<p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#5C6470;font-style:italic;">"${message}"<br><span style="font-style:normal;color:#5C6470;">&mdash; ${attribution}</span></p>`
+    : '';
+
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><title>${escapeHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:#F5F5F5;font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,serif;color:#1F2933;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#F5F5F5;padding:32px 16px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;background:#FFFFFF;">
+        <tr><td style="background:#1E3A5F;color:#FFFFFF;font-size:18px;font-weight:600;padding:24px;">Blueprint Theology</td></tr>
+        <tr><td style="background:#FFFFFF;padding:28px 24px;">
+          ${optionalMessageHtml}
+          <p style="margin:0 0 28px 0;font-size:15px;line-height:1.6;color:#1F2933;">Blueprint Theology is a guided Bible study tool that helps you discover Scripture rather than just consume it. ${escapeHtml(senderName)} thought you'd appreciate it.</p>
+          <table role="presentation" align="center" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;">
+            <tr><td align="center" style="background:#1E3A5F;border-radius:6px;">
+              <a href="${signInUrl}" style="display:inline-block;color:#FFFFFF;text-decoration:none;font-size:16px;font-weight:600;padding:14px 28px;">Get Started</a>
+            </td></tr>
+          </table>
+        </td></tr>
+        <tr><td style="background:#FFFFFF;padding:0 24px 24px 24px;font-size:12px;line-height:1.5;color:#5C6470;">Sent via Blueprint Theology &middot; aibibletool.com</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+
+  const textParts = [
+    'Blueprint Theology',
+    '',
+    optionalMessage ? `"${optionalMessage}"\n-- ${senderAttribution}` : '',
+    `Blueprint Theology is a guided Bible study tool that helps you discover Scripture rather than just consume it. ${senderName} thought you'd appreciate it.`,
+    '',
+    `Get Started: ${signInUrl}`,
+    '',
+    'Sent via Blueprint Theology · aibibletool.com',
+  ].filter(Boolean);
+
+  return { subject, html, text: textParts.join('\n\n') };
+}
+
+function composeGroupInviteEmail(user: any, recipientEmail: string, payload: any, optionalMessage?: string): ShareEmail {
+  const senderName = user.name || 'A friend';
+  const senderAttribution = user.name || user.email;
+  const groupNameRaw = payload.group_name.toString().trim();
+  const groupName = escapeHtml(groupNameRaw);
+  const inviteCodeRaw = payload.invite_code.toString().trim();
+  const inviteCode = escapeHtml(inviteCodeRaw);
+  const joinUrl = `https://aibibletool.com/?join=${encodeURIComponent(inviteCodeRaw)}`;
+  const subject = `${senderName} invited you to ${escapeHtml(groupNameRaw)}`;
+  const message = optionalMessage ? escapeHtml(optionalMessage) : '';
+  const attribution = escapeHtml(senderAttribution || recipientEmail);
+  const description = payload.group_description ? escapeHtml(payload.group_description.toString()) : '';
+
+  const optionalMessageHtml = message
+    ? `<p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#5C6470;font-style:italic;">"${message}"<br><span style="font-style:normal;color:#5C6470;">&mdash; ${attribution}</span></p>`
+    : '';
+  const descriptionHtml = description
+    ? `<p style="margin:0;font-size:14px;line-height:1.5;color:#5C6470;">${description}</p>`
+    : '';
+
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><title>${escapeHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:#F5F5F5;font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,serif;color:#1F2933;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#F5F5F5;padding:32px 16px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;background:#FFFFFF;">
+        <tr><td style="background:#1E3A5F;color:#FFFFFF;font-size:18px;font-weight:600;padding:24px;">Blueprint Theology</td></tr>
+        <tr><td style="background:#FFFFFF;padding:28px 24px;">
+          ${optionalMessageHtml}
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#F5F5F5;border-radius:8px;margin:0 0 28px 0;">
+            <tr><td style="padding:24px;">
+              <h2 style="margin:0 0 12px 0;font-size:22px;line-height:1.35;font-weight:600;color:#1E3A5F;">${groupName}</h2>
+              ${descriptionHtml}
+            </td></tr>
+          </table>
+          <table role="presentation" align="center" width="260" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto 14px auto;">
+            <tr><td align="center" style="background:#1E3A5F;border-radius:6px;">
+              <a href="${escapeHtml(joinUrl)}" style="display:block;color:#FFFFFF;text-decoration:none;font-size:16px;font-weight:600;padding:14px 28px;">Join ${groupName}</a>
+            </td></tr>
+          </table>
+          <p style="margin:0;text-align:center;font-size:12px;line-height:1.5;color:#5C6470;">Or enter code: ${inviteCode}</p>
+        </td></tr>
+        <tr><td style="background:#FFFFFF;padding:0 24px 24px 24px;font-size:12px;line-height:1.5;color:#5C6470;">Sent via Blueprint Theology &middot; aibibletool.com</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+
+  const textParts = [
+    'Blueprint Theology',
+    '',
+    optionalMessage ? `"${optionalMessage}"\n-- ${senderAttribution}` : '',
+    groupNameRaw,
+    payload.group_description ? payload.group_description.toString() : '',
+    '',
+    `Join: ${joinUrl}`,
+    `Or enter code: ${inviteCodeRaw}`,
+    '',
+    'Sent via Blueprint Theology · aibibletool.com',
+  ].filter(Boolean);
+
+  return { subject, html, text: textParts.join('\n\n') };
+}
+
+function composeInspirationCardEmail(user: any, recipientEmail: string, payload: any, optionalMessage?: string): ShareEmail {
+  const senderAttribution = user.name || user.email;
+  const verseReferenceRaw = payload.verse_reference.toString().trim();
+  const verseReference = escapeHtml(verseReferenceRaw);
+  const verseText = escapeHtml(payload.verse_text.toString()).replace(/\n/g, '<br>');
+  const reflectionText = escapeHtml(payload.reflection_text.toString()).replace(/\n/g, '<br>');
+  const cardImageUrl = payload.card_image_url ? escapeHtml(payload.card_image_url.toString()) : '';
+  const subject = `Today's verse: ${escapeHtml(verseReferenceRaw)}`;
+  const message = optionalMessage ? escapeHtml(optionalMessage) : '';
+  const attribution = escapeHtml(senderAttribution || recipientEmail);
+
+  const optionalMessageHtml = message
+    ? `<p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#5C6470;font-style:italic;">"${message}"<br><span style="font-style:normal;color:#5C6470;">&mdash; ${attribution}</span></p>`
+    : '';
+  const imageHtml = cardImageUrl
+    ? `<img src="${cardImageUrl}" style="max-width:100%;border-radius:6px;margin-bottom:24px;" alt="">`
+    : '';
+
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><title>${escapeHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:#F5F5F5;font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,serif;color:#1F2933;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#F5F5F5;padding:32px 16px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;background:#FFFFFF;">
+        <tr><td style="background:#1E3A5F;color:#FFFFFF;font-size:18px;font-weight:600;padding:24px;">Blueprint Theology</td></tr>
+        <tr><td style="background:#FFFFFF;padding:28px 24px;">
+          ${optionalMessageHtml}
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#F5F5F5;border-radius:8px;">
+            <tr><td style="padding:32px;">
+              ${imageHtml}
+              <div style="font-size:12px;line-height:1.4;color:#5C6470;letter-spacing:0.5px;text-transform:uppercase;margin:0 0 12px 0;">${verseReference}</div>
+              <p style="margin:0 0 24px 0;font-family:Georgia,'Times New Roman',serif;font-size:22px;line-height:1.5;color:#1F2933;font-style:italic;">${verseText}</p>
+              <p style="margin:0;font-size:15px;line-height:1.6;color:#5C6470;">${reflectionText}</p>
+            </td></tr>
+          </table>
+        </td></tr>
+        <tr><td style="background:#FFFFFF;padding:0 24px 24px 24px;font-size:12px;line-height:1.5;color:#5C6470;">Sent via Blueprint Theology &middot; aibibletool.com</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+
+  const textParts = [
+    'Blueprint Theology',
+    '',
+    optionalMessage ? `"${optionalMessage}"\n-- ${senderAttribution}` : '',
+    verseReferenceRaw,
+    payload.verse_text.toString(),
+    payload.reflection_text.toString(),
     '',
     'Sent via Blueprint Theology · aibibletool.com',
   ].filter(Boolean);
